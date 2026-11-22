@@ -1,0 +1,48 @@
+# Its own workspace root on purpose: without this, a parent workspace builds
+# the plugin implicitly and `cargo clippy --all-targets` in the parent sees it.
+[workspace]
+
+[package]
+name = "bddkit-etcd"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+description = "etcd v3 steps for the bddkit acceptance-testing tool"
+license = "Apache-2.0"
+repository = "https://github.com/bddkit/bddkit-etcd"
+homepage = "https://github.com/bddkit/bddkit-etcd"
+readme = "README.md"
+keywords = ["bdd", "gherkin", "testing", "etcd", "bddkit"]
+categories = ["development-tools::testing"]
+exclude = ["/.github", "/.idea", "/docker-compose.yml"]
+
+[lib]
+# rlib beside the cdylib so `tests/` can call the exports in-process.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+etcd-client = { version = "=0.21.1", default-features = false, features = ["tls-ring", "tls-native-roots"] }
+serde_json = "1.0"
+# `Status`, `Code` and the `Uri` the addresses are checked with: the version
+# etcd-client already builds on.
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+clone_on_ref_ptr = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+# noise for this project
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+format_push_string = "allow"
