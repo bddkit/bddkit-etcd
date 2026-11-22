@@ -202,3 +202,133 @@ impl Drop for Handle {
         call(bddkit_drop_instance(self.0));
     }
 }
+
+// ---- the secure servers of docker-compose.yml ----
+
+/// TLS only.
+pub fn secure_endpoint() -> String {
+    std::env::var("BDDKIT_TEST_ETCD_SECURE").unwrap_or_else(|_| "https://127.0.0.1:22379".into())
+}
+
+/// TLS, and authentication once `enable_auth` has run.
+pub fn auth_endpoint() -> String {
+    std::env::var("BDDKIT_TEST_ETCD_AUTH").unwrap_or_else(|_| "https://127.0.0.1:24379".into())
+}
+
+/// TLS, and a client certificate signed by the test CA is required.
+pub fn mtls_endpoint() -> String {
+    std::env::var("BDDKIT_TEST_ETCD_MTLS").unwrap_or_else(|_| "https://127.0.0.1:23379".into())
+}
+
+/// The name on the server certificate; the address is an IP it does not cover.
+pub const SERVER_NAME: &str = "etcd.test";
+pub const ROOT_PASSWORD: &str = "root-test-password-7f3a";
+
+/// A file of `tests/certs`, as the absolute path a config names.
+pub fn cert(name: &str) -> String {
+    root().join("tests/certs").join(name).display().to_string()
+}
+
+/// The secure server, reached the way a tester configures it: the CA and the
+/// name of the certificate.
+pub fn secure_config() -> Value {
+    json!({
+        "endpoints": secure_endpoint(),
+        "tls_ca": cert("ca.crt"),
+        "tls_server_name": SERVER_NAME,
+    })
+}
+
+pub fn root_config() -> Value {
+    let mut config = secure_config();
+    config["endpoints"] = json!(auth_endpoint());
+    config["username"] = json!("root");
+    config["password"] = json!(ROOT_PASSWORD);
+    config
+}
+
+pub fn mtls_config() -> Value {
+    json!({
+        "endpoints": mtls_endpoint(),
+        "tls_ca": cert("ca.crt"),
+        "tls_server_name": SERVER_NAME,
+        "tls_cert": cert("client.crt"),
+        "tls_key": cert("client.key"),
+    })
+}
+
+/// A client of the authentication server of the tests' own, not the plugin's: it sets
+/// the server up, and it breaks it.
+async fn admin(user: Option<(&str, &str)>) -> etcd_client::Client {
+    let tls = etcd_client::TlsOptions::new()
+        .ca_certificate(etcd_client::Certificate::from_pem(
+            std::fs::read(cert("ca.crt")).expect("ca.crt"),
+        ))
+        .domain_name(SERVER_NAME);
+    let mut options = etcd_client::ConnectOptions::new().with_tls(tls);
+    if let Some((name, password)) = user {
+        options = options.with_user(name, password);
+    }
+    etcd_client::Client::connect([auth_endpoint()], Some(options))
+        .await
+        .expect("connect to the secure etcd (is it up? docker compose up --wait etcd-auth)")
+}
+
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(future)
+}
+
+/// Creates the root user and switches authentication on, once per test
+/// binary. A server that already has it on (an earlier run) is left alone.
+pub fn enable_auth() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        block_on(async {
+            let mut auth = admin(None).await.auth_client();
+            // With authentication on, even a listing is refused.
+            if auth.role_list().await.is_err() {
+                return;
+            }
+            // Either may be left over from an interrupted run.
+            let _ = auth.role_add("root").await;
+            let _ = auth.user_add("root", ROOT_PASSWORD, None).await;
+            auth.user_grant_role("root", "root").await.expect("grant");
+            auth.auth_enable().await.expect("auth enable");
+        });
+    });
+}
+
+/// Every token the authentication server has issued stops being valid: authentication goes
+/// off and on again, which is what a member restart does to the simple tokens.
+pub fn invalidate_tokens() {
+    block_on(async {
+        admin(Some(("root", ROOT_PASSWORD)))
+            .await
+            .auth_client()
+            .auth_disable()
+            .await
+            .expect("auth disable");
+        admin(None)
+            .await
+            .auth_client()
+            .auth_enable()
+            .await
+            .expect("auth enable");
+    });
+}
+
+/// A token as the server issues them, to know what one looks like.
+pub fn sample_token() -> String {
+    block_on(async {
+        admin(None)
+            .await
+            .auth_client()
+            .authenticate("root".into(), ROOT_PASSWORD.into())
+            .await
+            .expect("authenticate")
+            .token()
+            .to_string()
+    })
+}

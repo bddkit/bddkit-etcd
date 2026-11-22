@@ -15,3 +15,70 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+
+  # TLS with a server certificate whose only name is etcd.test (the tests give
+  # `tls_server_name`). The healthchecks skip verification: the certificate does
+  # not name 127.0.0.1, on purpose, and a check that only waits for startup
+  # needs nothing from it.
+  etcd-secure:
+    image: quay.io/coreos/etcd:${ETCD_VERSION:-v3.6.17}
+    command:
+      - /usr/local/bin/etcd
+      - --data-dir=/tmp/etcd
+      - --listen-client-urls=https://0.0.0.0:2379
+      - --advertise-client-urls=https://127.0.0.1:22379
+      - --cert-file=/certs/server.crt
+      - --key-file=/certs/server.key
+    volumes:
+      - ./tests/certs:/certs:ro
+    ports:
+      - "22379:2379"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=https://127.0.0.1:2379", "--insecure-skip-tls-verify", "--cert=/certs/client.crt", "--key=/certs/client.key", "endpoint", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # The same, and a client certificate signed by the CA is required.
+  etcd-mtls:
+    image: quay.io/coreos/etcd:${ETCD_VERSION:-v3.6.17}
+    command:
+      - /usr/local/bin/etcd
+      - --data-dir=/tmp/etcd
+      - --listen-client-urls=https://0.0.0.0:2379
+      - --advertise-client-urls=https://127.0.0.1:23379
+      - --cert-file=/certs/server.crt
+      - --key-file=/certs/server.key
+      - --client-cert-auth
+      - --trusted-ca-file=/certs/ca.crt
+    volumes:
+      - ./tests/certs:/certs:ro
+    ports:
+      - "23379:2379"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=https://127.0.0.1:2379", "--insecure-skip-tls-verify", "--cert=/certs/client.crt", "--key=/certs/client.key", "endpoint", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # The same, and the tests switch authentication on: they create the root user
+  # themselves, because a scratch image has no shell to do it here. Its own
+  # server, because a test drops every token of it.
+  etcd-auth:
+    image: quay.io/coreos/etcd:${ETCD_VERSION:-v3.6.17}
+    command:
+      - /usr/local/bin/etcd
+      - --data-dir=/tmp/etcd
+      - --listen-client-urls=https://0.0.0.0:2379
+      - --advertise-client-urls=https://127.0.0.1:24379
+      - --cert-file=/certs/server.crt
+      - --key-file=/certs/server.key
+    volumes:
+      - ./tests/certs:/certs:ro
+    ports:
+      - "24379:2379"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=https://127.0.0.1:2379", "--insecure-skip-tls-verify", "--cert=/certs/client.crt", "--key=/certs/client.key", "--user=root:root-test-password-7f3a", "endpoint", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

@@ -3,8 +3,7 @@
 //! no `bddkit` binary. The live tests need the server `docker-compose.yml`
 //! starts, at `BDDKIT_TEST_ETCD` or `http://127.0.0.1:2379`.
 //!
-//! The credentials-refused branch of the probe has no test here: it needs a
-//! server with authentication enabled, which is a fixture of its own (#6).
+//! TLS and authentication are in `tests/secure.rs`.
 
 #![allow(
     clippy::expect_used,

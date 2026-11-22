@@ -145,6 +145,13 @@ pub fn explain(error: &etcd_client::Error, tls: bool) -> String {
                 format!("TLS did not agree: {io}")
             }
             Some(io) => not_reached(&io.to_string()),
+            // A server that refuses the handshake (a missing client
+            // certificate, say) may close the connection before its alert is
+            // read, and the client reports a cancelled request, not an I/O error.
+            None if tls && status.code() == tonic::Code::Cancelled => format!(
+                "TLS did not agree: the server closed the connection ({})",
+                status.message()
+            ),
             None => not_reached(status.message()),
         };
     }
@@ -230,6 +237,19 @@ mod tests {
             assert!(explain(&transport(kind), true).starts_with("TLS did not agree: "));
             assert!(explain(&transport(kind), false).starts_with("the server was not reached: "));
         }
+    }
+
+    #[test]
+    fn a_connection_closed_during_the_handshake_is_tls_only_on_an_https_endpoint() {
+        let closed = || {
+            let mut status = Status::new(Code::Cancelled, "operation was canceled");
+            status.set_source(std::sync::Arc::new(std::fmt::Error));
+            Error::GRpcStatus(status)
+        };
+        // The source is not an `io::Error`, as hyper's own error is not.
+        let text = explain(&closed(), true);
+        assert!(text.starts_with("TLS did not agree: "), "{text}");
+        assert!(explain(&closed(), false).starts_with("the server was not reached: "),);
     }
 
     #[test]
