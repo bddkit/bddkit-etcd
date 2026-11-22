@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The host the plugin is tested against: a released bddkit. Bump it
+  # deliberately, as its own commit, so a failure after the bump is attributable.
+  HOST_TAG: v0.5.0
+
+jobs:
+  lint:
+    name: fmt & clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # etcd-client's build script compiles .proto files: it needs protoc and
+      # the well-known types that ship with libprotobuf-dev.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      # Pinned on purpose: on a floating stable a new clippy lint reddens PRs
+      # that have nothing to do with it. rustflags is emptied so only the
+      # clippy invocation below carries -D warnings.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.97.1"
+          components: clippy, rustfmt
+          rustflags: ""
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: File size budget
+        run: |
+          files=$(git ls-files '*.rs' '*.feature' '*.yaml' '*.yml' ':!.github/')
+          status=0
+          while IFS= read -r file; do
+            lines=$(wc -l < "$file")
+            if [ "$lines" -gt 1000 ]; then
+              echo "::error file=$file::$lines lines, the limit is 1000"
+              status=1
+            fi
+          done <<< "$files"
+          exit "$status"
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: test (etcd ${{ matrix.etcd }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The latest patch of each supported minor. Raise them with the releases.
+        etcd: [v3.5.36, v3.6.17]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.97.1"
+          rustflags: ""
+
+      - name: Cache the host
+        id: host
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/bddkit-host
+          key: bddkit-host-${{ env.HOST_TAG }}-${{ runner.os }}
+      - name: Install the host
+        if: steps.host.outputs.cache-hit != 'true'
+        run: >-
+          cargo install --git https://github.com/bddkit/bddkit --tag "$HOST_TAG"
+          --locked --root "$RUNNER_TEMP/bddkit-host" bddkit
+
+      # --wait returns once the healthcheck passes.
+      - name: Start etcd
+        env:
+          ETCD_VERSION: ${{ matrix.etcd }}
+        run: docker compose up --wait etcd
+
+      - name: Tests
+        run: |
+          export BDDKIT_BIN="$RUNNER_TEMP/bddkit-host/bin/bddkit"
+          cargo test --locked

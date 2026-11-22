@@ -1,0 +1,17 @@
+services:
+  # A plain etcd, no TLS and no authentication. ETCD_VERSION picks the release:
+  # CI runs the latest patch of 3.5 and of 3.6.
+  etcd:
+    image: quay.io/coreos/etcd:${ETCD_VERSION:-v3.6.17}
+    command:
+      - /usr/local/bin/etcd
+      - --data-dir=/tmp/etcd
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:2379
+    ports:
+      - "2379:2379"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "endpoint", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
