@@ -4,8 +4,13 @@
 
 mod client;
 pub mod config;
+mod error;
+mod evidence;
+mod instance;
+mod ops;
 mod reply;
 mod runtime;
+mod steps;
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
@@ -14,7 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use config::Config;
+use instance::Instance;
 use serde_json::Value;
+use steps::Step;
 
 /// The plugin ABI this library is built for.
 const ABI: u32 = 4;
@@ -58,8 +65,9 @@ pub fn manifest_json() -> String {
         "name": "etcd",
         "version": env!("CARGO_PKG_VERSION"),
         "groups": ["etcd"],
-        // The plugin keeps per-scenario state from the next phase on, and the
-        // host allows a reset under parallel runs only in this mode.
+        // The plugin keeps per-scenario state (the last operation, later the
+        // watches), and the host allows a reset under parallel runs only in
+        // this mode.
         "concurrency": "per_worker",
         // No `implicit_instance`: a server has no default address.
         "fields": { "etcd": config::fields_json() },
@@ -77,11 +85,19 @@ pub extern "C" fn bddkit_manifest() -> *mut c_char {
     guard("envelope", manifest_json)
 }
 
-/// No steps yet: the index of a step is its identity, so the array grows by
-/// appending.
+/// The index of a step is its identity, so the array grows by appending.
 #[unsafe(no_mangle)]
 pub extern "C" fn bddkit_list_steps() -> *mut c_char {
-    guard("envelope", || "[]".to_string())
+    guard("envelope", steps::list_json)
+}
+
+/// Before the first request, with no handle: what a step's arguments can be
+/// checked for without a server.
+#[unsafe(no_mangle)]
+pub extern "C" fn bddkit_validate_step(step_index: u32, request: *const c_char) -> *mut c_char {
+    guard("envelope", move || {
+        steps::validate(step_index, &input(request))
+    })
 }
 
 /// # Safety
@@ -140,12 +156,6 @@ pub extern "C" fn bddkit_probe_config(request: *const c_char) -> *mut c_char {
     })
 }
 
-/// What a handle holds. The client joins it at the first dispatch.
-struct Instance {
-    #[expect(dead_code, reason = "read by the steps of the next issue")]
-    config: Config,
-}
-
 /// A handle is an index into this table, never a pointer.
 static INSTANCES: LazyLock<Mutex<HashMap<u64, Arc<Instance>>>> = LazyLock::new(Mutex::default);
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
@@ -168,7 +178,7 @@ fn init(request: &str) -> String {
     match Config::parse(&body) {
         Ok(config) => {
             let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-            instances().insert(handle, Arc::new(Instance { config }));
+            instances().insert(handle, Arc::new(Instance::new(config)));
             reply::handle(handle)
         }
         Err(error) => reply::err(error, &secrets),
@@ -183,15 +193,45 @@ pub extern "C" fn bddkit_init_instance(request: *const c_char) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn bddkit_dispatch(
     handle: u64,
-    _step_index: u32,
-    _request: *const c_char,
+    step_index: u32,
+    request: *const c_char,
 ) -> *mut c_char {
     guard("dispatch", move || {
-        if instances().contains_key(&handle) {
-            reply::fatal("unknown step")
-        } else {
-            reply::fatal("unknown handle")
+        let Some(step) = Step::from_index(step_index) else {
+            return reply::fatal("unknown step");
+        };
+        // Cloned out so the table is not locked while the step runs.
+        let Some(instance) = instances().get(&handle).map(Arc::clone) else {
+            return reply::fatal("unknown handle");
+        };
+        let request = match ops::Request::parse(&input(request)) {
+            Ok(request) => request,
+            Err(error) => return reply::fatal(&format!("malformed dispatch request: {error}")),
+        };
+        runtime::block_on(async { Ok(ops::run(&instance, step, &request).await) })
+            .unwrap_or_else(|error| reply::fatal(&error))
+    })
+}
+
+/// The scenario boundary. Opens no connection.
+#[unsafe(no_mangle)]
+pub extern "C" fn bddkit_reset_scenario(handle: u64) -> *mut c_char {
+    guard("envelope", move || match instances().get(&handle) {
+        Some(instance) => {
+            instance.forget();
+            reply::ok()
         }
+        None => reply::err("unknown handle", &[]),
+    })
+}
+
+/// The last operation of the scenario, for the dump of any failing step.
+#[unsafe(no_mangle)]
+pub extern "C" fn bddkit_failure_context(handle: u64) -> *mut c_char {
+    guard("envelope", move || {
+        let last = instances().get(&handle).and_then(|i| i.last());
+        let last = last.unwrap_or_default();
+        reply::failure_context(&last.diagnostics, &last.scan)
     })
 }
 

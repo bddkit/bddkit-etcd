@@ -11,9 +11,12 @@
     reason = "each test binary uses a part of this module; `allow-*-in-tests` covers only `#[test]` functions, not the helpers here"
 )]
 
+use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
+
+use serde_json::{Value, json};
 
 /// The server the live tests reach: the one `docker-compose.yml` starts.
 pub fn etcd_endpoint() -> String {
@@ -91,13 +94,18 @@ pub fn bddkit(bin: &Path, args: &[&str]) -> Output {
 /// A config declaring `resources.etcd` as `section`, over a feature that
 /// needs no resource, so every outcome comes from the instances.
 pub fn project(name: &str, section: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("bddkit-etcd-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::write(
-        dir.join("features/only.feature"),
+    project_with(
+        name,
+        section,
         "Feature: only\n  Scenario: one\n    Given set variable \"x\" to \"1\"\n",
     )
-    .expect("feature");
+}
+
+/// The same, over a feature of the test's own.
+pub fn project_with(name: &str, section: &str, feature: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("bddkit-etcd-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::write(dir.join("features/only.feature"), feature).expect("feature");
     let config = dir.join("cfg.yaml");
     std::fs::write(
         &config,
@@ -120,4 +128,26 @@ pub fn combined(out: &Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// A reply of an export, parsed and handed back to `bddkit_free_string`.
+pub fn call(reply: *mut c_char) -> Value {
+    assert!(!reply.is_null(), "an export returned NULL");
+    // SAFETY: not null (asserted above), and every reply of this library comes
+    // from `CString::into_raw`, so it is NUL-terminated and lives until it is
+    // freed below.
+    let text = unsafe { CStr::from_ptr(reply) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: an export returned it, and this is the one place it is freed.
+    unsafe { bddkit_etcd::bddkit_free_string(reply) };
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
+}
+
+pub fn cstr(v: &Value) -> CString {
+    CString::new(v.to_string()).expect("no NUL")
+}
+
+pub fn request(config: &Value) -> CString {
+    cstr(&json!({"group": "etcd", "instance": "main", "config": config, "options": {}}))
 }
