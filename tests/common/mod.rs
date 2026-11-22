@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
+use bddkit_etcd::*;
 use serde_json::{Value, json};
 
 /// The server the live tests reach: the one `docker-compose.yml` starts.
@@ -150,4 +151,54 @@ pub fn cstr(v: &Value) -> CString {
 
 pub fn request(config: &Value) -> CString {
     cstr(&json!({"group": "etcd", "instance": "main", "config": config, "options": {}}))
+}
+
+/// A handle that is dropped with it.
+pub struct Handle(pub u64);
+
+impl Handle {
+    pub fn new(config: &Value) -> Self {
+        let reply = call(bddkit_init_instance(request(config).as_ptr()));
+        Self(reply["handle"].as_u64().expect("handle"))
+    }
+
+    pub fn live() -> Self {
+        Self::new(&json!({"endpoints": etcd_endpoint()}))
+    }
+
+    pub fn dispatch(
+        &self,
+        step: u32,
+        args: &[&str],
+        docstring: Option<&str>,
+        debug: bool,
+    ) -> Value {
+        self.send(step, args, docstring, None, debug)
+    }
+
+    pub fn send(
+        &self,
+        step: u32,
+        args: &[&str],
+        docstring: Option<&str>,
+        table: Option<&[&[&str]]>,
+        debug: bool,
+    ) -> Value {
+        let request = json!({"args": args, "docstring": docstring, "table": table, "debug": debug, "instance": "main"});
+        call(bddkit_dispatch(self.0, step, cstr(&request).as_ptr()))
+    }
+
+    pub fn run(&self, step: u32, args: &[&str]) -> Value {
+        self.dispatch(step, args, None, false)
+    }
+
+    pub fn context(&self) -> Value {
+        call(bddkit_failure_context(self.0))
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        call(bddkit_drop_instance(self.0));
+    }
 }
