@@ -94,4 +94,6 @@ jobs:
       - name: Tests
         run: |
           export BDDKIT_BIN="$RUNNER_TEMP/bddkit-host/bin/bddkit"
+          # The server is the job's own: a test may clear all of it.
+          export BDDKIT_TEST_ETCD_WIPE=1
           cargo test --locked
