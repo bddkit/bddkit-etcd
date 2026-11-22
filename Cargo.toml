@@ -26,7 +26,7 @@ serde_json = "1.0"
 # `Status`, `Code` and the `Uri` the addresses are checked with: the version
 # etcd-client already builds on.
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
-tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "time", "sync"] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -1,7 +1,11 @@
 //! Every reply the plugin sends is built here, so the shape the host parses
 //! has one author.
 
-use serde_json::json;
+use std::collections::BTreeMap;
+
+use serde_json::{Value, json};
+
+use crate::error::StepError;
 
 /// An `ok` envelope with the one-line `detail` the host shows in `doctor`, and
 /// the values the host must keep out of everything it prints.
@@ -28,10 +32,50 @@ pub fn fatal(error: &str) -> String {
     json!({"status": "fatal", "error": error}).to_string()
 }
 
+/// The step passed: its variables, its debug lines, its evidence.
+pub fn passed(
+    vars: &BTreeMap<String, String>,
+    output: &[Value],
+    diagnostics: &[Value],
+    scan: &[Value],
+) -> String {
+    json!({
+        "status": "passed",
+        "vars": vars,
+        "output": output,
+        "diagnostics": diagnostics,
+        "scan": scan,
+    })
+    .to_string()
+}
+
+/// The step failed for good, in the class its error was born with. No
+/// variables travel on a failure.
+pub fn failed(
+    error: &StepError,
+    output: &[Value],
+    diagnostics: &[Value],
+    scan: &[Value],
+) -> String {
+    json!({
+        "status": "fatal",
+        "error": error.message,
+        "class": error.class.as_str(),
+        "output": output,
+        "diagnostics": diagnostics,
+        "scan": scan,
+    })
+    .to_string()
+}
+
+/// The answer of `bddkit_failure_context`.
+pub fn failure_context(diagnostics: &[Value], scan: &[Value]) -> String {
+    json!({"diagnostics": diagnostics, "scan": scan}).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
 
     #[test]
     fn a_refusal_carries_the_secrets_beside_the_error() {

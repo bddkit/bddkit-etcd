@@ -8,6 +8,7 @@ use std::time::Duration;
 use etcd_client::{Certificate, Client, ConnectOptions, Identity, TlsOptions};
 
 use crate::config::Config;
+use crate::error::{Class, StepError};
 
 /// What the config means as connect options: both timeouts are
 /// `timeout_secs`, TLS is on for `https`, and the roots are the system's
@@ -46,18 +47,33 @@ fn read(path: &std::path::Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("cannot read \"{}\": {e}", path.display()))
 }
 
+/// The client's own timeouts get a second of slack: with the same duration
+/// they raced the timer that wraps the call, and when the client's fired first
+/// the message said "Timeout expired" instead of "no response within N s".
+fn with_slack(options: ConnectOptions, config: &Config) -> ConnectOptions {
+    let slack = Duration::from_secs(config.timeout_secs.saturating_add(1));
+    options.with_timeout(slack).with_connect_timeout(slack)
+}
+
+/// What every step's client is built with. The token is refreshed when the
+/// server calls it invalid (an idle file outlives it, a member restart drops
+/// it), because the client lives as long as the feature file. `require_leader` is on every
+/// request: without it a cluster that lost its leader holds the request until
+/// the server's own timeout, and the client's fires first as `Cancelled`
+/// instead of `Unavailable`. The probe leaves it off, because `Status` is
+/// answered by a node with no leader too.
+pub fn step_options(config: &Config) -> Result<ConnectOptions, String> {
+    Ok(with_slack(connect_options(config)?, config)
+        .with_auto_token_refresh(true)
+        .with_require_leader(true))
+}
+
 /// `Status` on every endpoint, each reached with a client of its own: one
 /// client over several addresses balances, and would answer for whichever it
 /// picked. `detail` is the version and the revision of each.
 pub async fn probe(config: &Config) -> Result<String, String> {
     let timeout = Duration::from_secs(config.timeout_secs);
-    // The client's own timeouts get a second of slack: with the same duration
-    // they raced the one below, and when the client's fired first the message
-    // said "Timeout expired" instead of "no response within N s".
-    let slack = timeout + Duration::from_secs(1);
-    let options = connect_options(config)?
-        .with_timeout(slack)
-        .with_connect_timeout(slack);
+    let options = with_slack(connect_options(config)?, config);
     let mut lines = Vec::new();
     for endpoint in &config.endpoints {
         let attempt = async {
@@ -94,7 +110,7 @@ pub async fn probe(config: &Config) -> Result<String, String> {
     })
 }
 
-fn not_reached(why: &str) -> String {
+pub fn not_reached(why: &str) -> String {
     format!("the server was not reached: {why}")
 }
 
@@ -142,10 +158,44 @@ pub fn explain(error: &etcd_client::Error, tls: bool) -> String {
         | tonic::Code::FailedPrecondition => {
             format!("the server refused the credentials: {}", status.message())
         }
-        code => format!(
-            "the server answered with an error ({code:?}): {}",
-            status.message()
-        ),
+        _ => server_error(status),
+    }
+}
+
+/// What the server answered, for a status that came from it.
+fn server_error(status: &tonic::Status) -> String {
+    format!(
+        "the server answered with an error ({:?}): {}",
+        status.code(),
+        status.message()
+    )
+}
+
+/// Whether the server answered. A status with a `source()` never left the
+/// client (connect, transport, timeout); one without came from the server, and
+/// so does every error that is not a status the server could have sent.
+pub fn class_of(error: &etcd_client::Error) -> Class {
+    match error {
+        etcd_client::Error::GRpcStatus(status) if status.source().is_none() => Class::DbStatement,
+        _ => Class::DbConnection,
+    }
+}
+
+/// A failure while the client is being built: a refused password arrives here
+/// as a status of the server's, and `explain` says what it means.
+pub fn connect_failure(error: &etcd_client::Error, tls: bool) -> StepError {
+    StepError::new(class_of(error), explain(error, tls))
+}
+
+/// A failure of one request. Unlike a connect, a status here is the server's
+/// answer to the request and says nothing about credentials: an empty key is
+/// `InvalidArgument` too.
+pub fn request_failure(error: &etcd_client::Error, tls: bool) -> StepError {
+    match (error, class_of(error)) {
+        (etcd_client::Error::GRpcStatus(status), Class::DbStatement) => {
+            StepError::new(Class::DbStatement, server_error(status))
+        }
+        _ => connect_failure(error, tls),
     }
 }
 
@@ -156,7 +206,8 @@ mod tests {
     use etcd_client::Error;
     use tonic::{Code, Status};
 
-    use super::explain;
+    use super::{class_of, explain, request_failure};
+    use crate::error::Class;
 
     fn transport(kind: ErrorKind) -> Error {
         Error::GRpcStatus(Status::from_error(Box::new(io::Error::new(
@@ -209,5 +260,41 @@ mod tests {
     fn an_error_that_is_not_a_status_never_reached_the_server() {
         let text = explain(&Error::InvalidArgs("bad".to_string()), false);
         assert!(text.starts_with("the server was not reached: "));
+    }
+
+    #[test]
+    fn the_class_is_the_source_of_the_status_and_never_its_text() {
+        let from_server = Error::GRpcStatus(Status::new(Code::Unavailable, "socket closed"));
+        assert_eq!(class_of(&from_server), Class::DbStatement);
+        let client_side = transport(ErrorKind::ConnectionRefused);
+        assert_eq!(class_of(&client_side), Class::DbConnection);
+        // A status that says "refused" in words but carries a source.
+        let worded = Error::GRpcStatus(Status::from_error(Box::new(io::Error::other(
+            "the server answered with an error",
+        ))));
+        assert_eq!(class_of(&worded), Class::DbConnection);
+        assert_eq!(
+            class_of(&Error::InvalidArgs("bad".to_string())),
+            Class::DbConnection
+        );
+    }
+
+    #[test]
+    fn a_refused_request_is_not_called_a_refused_password() {
+        let error = request_failure(
+            &Error::GRpcStatus(Status::new(
+                Code::InvalidArgument,
+                "etcdserver: key is not provided",
+            )),
+            false,
+        );
+        assert_eq!(error.class, Class::DbStatement);
+        assert_eq!(
+            error.message,
+            "the server answered with an error (InvalidArgument): etcdserver: key is not provided"
+        );
+        let down = request_failure(&transport(ErrorKind::ConnectionRefused), false);
+        assert_eq!(down.class, Class::DbConnection);
+        assert!(down.message.starts_with("the server was not reached: "));
     }
 }

@@ -15,39 +15,26 @@
 
 mod common;
 
-use std::ffi::{CStr, CString, c_char};
 use std::time::{Duration, Instant};
 
 use bddkit_etcd::*;
-use serde_json::{Value, json};
-
-fn call(reply: *mut c_char) -> Value {
-    assert!(!reply.is_null(), "an export returned NULL");
-    // SAFETY: not null (asserted above), and every reply of this library comes
-    // from `CString::into_raw`, so it is NUL-terminated and lives until it is
-    // freed below.
-    let text = unsafe { CStr::from_ptr(reply) }
-        .to_string_lossy()
-        .into_owned();
-    // SAFETY: an export returned it, and this is the one place it is freed.
-    unsafe { bddkit_free_string(reply) };
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
-}
-
-fn cstr(v: &Value) -> CString {
-    CString::new(v.to_string()).expect("no NUL")
-}
-
-fn request(config: &Value) -> CString {
-    cstr(&json!({"group": "etcd", "instance": "main", "config": config, "options": {}}))
-}
+use common::{call, cstr, request};
+use serde_json::json;
 
 #[test]
 fn the_manifest_and_the_step_list_are_what_the_host_loads() {
     assert_eq!(bddkit_abi_version(), 4);
     let manifest = call(bddkit_manifest());
     assert_eq!(manifest["groups"], json!(["etcd"]));
-    assert_eq!(call(bddkit_list_steps()), json!([]));
+    let steps = call(bddkit_list_steps());
+    assert_eq!(steps.as_array().expect("an array").len(), 6);
+    assert!(
+        steps
+            .as_array()
+            .expect("an array")
+            .iter()
+            .all(|s| s["group"] == "etcd")
+    );
 }
 
 #[test]
@@ -99,9 +86,10 @@ fn a_step_that_does_not_exist_is_fatal_not_a_crash() {
         .expect("handle");
     let reply = call(bddkit_dispatch(
         handle,
-        0,
+        99,
         cstr(&json!({"args": []})).as_ptr(),
     ));
+    assert_eq!(reply["error"], "unknown step");
     assert_eq!(reply["status"], "fatal");
     assert_eq!(call(bddkit_drop_instance(handle))["ok"], true);
 }
