@@ -50,8 +50,14 @@ fn read(path: &std::path::Path) -> Result<Vec<u8>, String> {
 /// client over several addresses balances, and would answer for whichever it
 /// picked. `detail` is the version and the revision of each.
 pub async fn probe(config: &Config) -> Result<String, String> {
-    let options = connect_options(config)?;
     let timeout = Duration::from_secs(config.timeout_secs);
+    // The client's own timeouts get a second of slack: with the same duration
+    // they raced the one below, and when the client's fired first the message
+    // said "Timeout expired" instead of "no response within N s".
+    let slack = timeout + Duration::from_secs(1);
+    let options = connect_options(config)?
+        .with_timeout(slack)
+        .with_connect_timeout(slack);
     let mut lines = Vec::new();
     for endpoint in &config.endpoints {
         let attempt = async {
