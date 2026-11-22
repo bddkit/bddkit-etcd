@@ -49,7 +49,8 @@ pub fn passed(
     .to_string()
 }
 
-/// The step failed for good, in the class its error was born with. No
+/// The step failed, in the class its error was born with: `fatal`, or
+/// `not_yet` when it is an assertion's and a fresh read may change it. No
 /// variables travel on a failure.
 pub fn failed(
     error: &StepError,
@@ -58,7 +59,7 @@ pub fn failed(
     scan: &[Value],
 ) -> String {
     json!({
-        "status": "fatal",
+        "status": if error.retry { "not_yet" } else { "fatal" },
         "error": error.message,
         "class": error.class.as_str(),
         "output": output,

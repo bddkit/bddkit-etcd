@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use etcd_client::{Client, DeleteOptions, ResponseHeader};
 use serde_json::{Value, json};
 
+use crate::check::{self, Check};
 use crate::client::request_failure;
 use crate::error::{Class, StepError};
 use crate::evidence::{Record, base64, shown};
@@ -17,8 +18,9 @@ use crate::steps::{EMPTY_PREFIX, Step};
 
 /// What a step reads of the dispatch request.
 pub struct Request {
-    args: Vec<String>,
-    docstring: Option<String>,
+    pub args: Vec<String>,
+    pub docstring: Option<String>,
+    pub table: Option<Vec<Vec<String>>>,
     debug: bool,
     instance: String,
 }
@@ -34,16 +36,34 @@ impl Request {
                 .map(|a| a.as_str().unwrap_or_default().to_string())
                 .collect(),
             docstring: value["docstring"].as_str().map(str::to_string),
+            table: value["table"].as_array().map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        row.as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|c| c.as_str().unwrap_or_default().to_string())
+                            .collect()
+                    })
+                    .collect()
+            }),
             debug: value["debug"].as_bool().unwrap_or(false),
             instance: value["instance"].as_str().unwrap_or_default().to_string(),
         })
     }
 
-    fn arg(&self, index: usize) -> Result<&str, StepError> {
+    pub fn arg(&self, index: usize) -> Result<&str, StepError> {
         self.args
             .get(index)
             .map(String::as_str)
             .ok_or_else(|| StepError::input(format!("the step has no argument {}", index + 1)))
+    }
+
+    /// The doc string of a step that needs one.
+    pub fn doc(&self) -> Result<&str, StepError> {
+        self.docstring
+            .as_deref()
+            .ok_or_else(|| StepError::input("the step needs a doc string"))
     }
 }
 
@@ -64,7 +84,7 @@ enum Action {
 /// The value a doc string means: gherkin keeps the line break after the
 /// opening quotes and the one before the closing quotes, and they are not
 /// part of the value.
-fn doc_value(docstring: &str) -> &str {
+pub fn doc_value(docstring: &str) -> &str {
     let text = docstring.strip_prefix('\n').unwrap_or(docstring);
     text.strip_suffix('\n').unwrap_or(text)
 }
@@ -77,16 +97,10 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
             key: key()?,
             value: request.arg(1)?.to_string(),
         },
-        Step::PutDocString => {
-            let docstring = request
-                .docstring
-                .as_deref()
-                .ok_or_else(|| StepError::input("the step needs a doc string for the value"))?;
-            Action::Put {
-                key: key()?,
-                value: doc_value(docstring).to_string(),
-            }
-        }
+        Step::PutDocString => Action::Put {
+            key: key()?,
+            value: doc_value(request.doc()?).to_string(),
+        },
         Step::Get => Action::Get { key: key()? },
         Step::DeleteKey => Action::Delete(Range::Key(key()?)),
         // An empty value that came through a variable: a literal one never
@@ -96,10 +110,43 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
             prefix => Action::Delete(Range::Prefix(prefix)),
         },
         Step::DeleteAll => Action::Delete(Range::All),
+        Step::Exists
+        | Step::Absent
+        | Step::HasValue
+        | Step::HasValueDoc
+        | Step::Matches
+        | Step::ContainsJson
+        | Step::EqualsJson
+        | Step::HasFields
+        | Step::Count
+        | Step::KeysBe
+        | Step::KeysContain => return Err(StepError::input("not an action")),
     })
 }
 
-fn record_for(action: &Action, instance: &str) -> Record {
+/// What a step does: an action that changes the server, or an assertion that
+/// only reads it and may be asked again.
+enum Op {
+    Act(Action),
+    Check(Check),
+}
+
+fn plan_op(step: Step, request: &Request) -> Result<Op, StepError> {
+    if step.is_assertion() {
+        check::plan(step, request).map(Op::Check)
+    } else {
+        plan(step, request).map(Op::Act)
+    }
+}
+
+fn record_for(op: &Op, instance: &str) -> Record {
+    match op {
+        Op::Check(check) => check::record_for(check, instance),
+        Op::Act(action) => record_for_action(action, instance),
+    }
+}
+
+fn record_for_action(action: &Action, instance: &str) -> Record {
     match action {
         Action::Put { key, value } => {
             let mut record = Record::new("Put", key, instance, json!({"key": key, "value": value}));
@@ -140,7 +187,7 @@ fn revision_vars(header: &ResponseHeader) -> Vars {
     BTreeMap::from([("etcd_revision".to_string(), header.revision().to_string())])
 }
 
-async fn perform(
+async fn perform_action(
     client: &Client,
     tls: bool,
     action: &Action,
@@ -214,12 +261,26 @@ async fn perform(
     }
 }
 
+async fn perform(
+    client: &Client,
+    tls: bool,
+    op: &Op,
+    record: &mut Record,
+) -> Result<Vars, StepError> {
+    match op {
+        Op::Act(action) => perform_action(client, tls, action, record).await,
+        Op::Check(check) => check::perform(client, tls, check, record)
+            .await
+            .map(|()| Vars::new()),
+    }
+}
+
 pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
-    let action = match plan(step, request) {
-        Ok(action) => action,
+    let op = match plan_op(step, request) {
+        Ok(op) => op,
         Err(error) => return reply::failed(&error, &[], &[], &[]),
     };
-    let mut record = record_for(&action, &request.instance);
+    let mut record = record_for(&op, &request.instance);
     let seconds = instance.config.timeout_secs;
     let limit = Duration::from_secs(seconds);
     // Each phase has `timeout_secs` of its own. Neither names the phase it
@@ -237,11 +298,17 @@ pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
             .await
             .map_err(|_| no_response())??;
         let tls = instance.config.tls;
-        tokio::time::timeout(limit, perform(client, tls, &action, &mut record))
+        tokio::time::timeout(limit, perform(client, tls, &op, &mut record))
             .await
             .map_err(|_| no_response())?
     }
     .await;
+    // An assertion is asked again by the host; an action never answers
+    // `not_yet`.
+    let result = match op {
+        Op::Check(_) => result.map_err(StepError::polled),
+        Op::Act(_) => result,
+    };
     record.took(started.elapsed());
     let diagnostics = vec![record.diagnostic()];
     let output = if request.debug {
@@ -269,6 +336,7 @@ mod tests {
         Request {
             args: args.iter().map(ToString::to_string).collect(),
             docstring: docstring.map(ToString::to_string),
+            table: None,
             debug: false,
             instance: "main".to_string(),
         }

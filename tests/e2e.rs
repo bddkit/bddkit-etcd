@@ -191,3 +191,110 @@ fn a_failing_step_of_the_host_shows_the_last_etcd_operation() {
     );
     assert!(text.contains("\"instance\": \"main\""), "{text}");
 }
+
+/// Deletes what a failing scenario left under its prefix.
+fn wipe(prefix: &str) {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let mut client = etcd_client::Client::connect([etcd_endpoint()], None)
+            .await
+            .expect("connect");
+        let options = etcd_client::DeleteOptions::new().with_prefix();
+        client.delete(prefix, Some(options)).await.expect("delete");
+    });
+}
+
+/// Runs the host on `cfg` with a JUnit report, and hands back the exit code,
+/// the console and the report.
+fn run_with_report(bin: &std::path::Path, cfg: &std::path::Path) -> (Option<i32>, String, String) {
+    let report = cfg.with_file_name("report.xml");
+    let out = bddkit(
+        bin,
+        &["run", "--config", path(cfg), "--junit", path(&report)],
+    );
+    let xml = std::fs::read_to_string(&report).unwrap_or_default();
+    (out.status.code(), combined(&out), xml)
+}
+
+#[test]
+fn a_polled_assertion_passes_once_a_key_is_written_after_it_started() {
+    let bin = require_bddkit!();
+    let name = "polled";
+    let key = format!("/bddkit-etcd/e2e/{name}/{}/late", std::process::id());
+    // The first line fails loudly if the key is there before the polling
+    // starts, which would make the pass below prove nothing.
+    let cfg = keys_project(
+        name,
+        r#"    Then etcd key "<<prefix>>late" should not exist
+    And I expect the next assertion to pass within 15 seconds, checking every 200 milliseconds
+    And etcd key "<<prefix>>late" should have value "arrived"
+    When I delete etcd keys with prefix "<<prefix>>"
+"#,
+    );
+    // The plugin is built on first use: do it before the writer's clock starts,
+    // or the key could be there before the host reaches the step.
+    common::lock_dir();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let mut client = etcd_client::Client::connect([etcd_endpoint()], None)
+                .await
+                .expect("connect");
+            client
+                .put(key.as_str(), "arrived", None)
+                .await
+                .expect("put");
+        });
+    });
+    let (code, text, _) = run_with_report(&bin, &cfg);
+    writer.join().expect("writer");
+    assert_eq!(code, Some(0), "{text}");
+}
+
+#[test]
+fn a_polled_assertion_that_runs_out_keeps_the_class_of_its_last_attempt() {
+    let bin = require_bddkit!();
+    // A wrong value: the server answered, the check did not hold.
+    let cfg = keys_project(
+        "wrong",
+        r#"    When I put etcd key "<<prefix>>k" with value "30s"
+    Then I expect the next assertion to pass within 2 seconds, checking every 200 milliseconds
+    And etcd key "<<prefix>>k" should have value "60s"
+"#,
+    );
+    let (code, text, xml) = run_with_report(&bin, &cfg);
+    wipe(&format!("/bddkit-etcd/e2e/wrong/{}/", std::process::id()));
+    assert_eq!(code, Some(1), "{text}");
+    assert!(
+        text.contains("has value \"30s\", expected \"60s\""),
+        "{text}"
+    );
+    assert!(xml.contains("type=\"assertion\""), "{xml}");
+
+    // A dead server: the same step, and the class says it was never reached.
+    let feature = "Feature: dead\n  Scenario: one\n    Then I expect the next assertion to pass within 2 seconds, checking every 200 milliseconds\n    And etcd key \"/k\" should exist\n";
+    let cfg = project_with(
+        "dead",
+        "    main:\n      endpoints: \"http://127.0.0.1:1\"\n      timeout_secs: 1\n",
+        feature,
+    );
+    let (code, text, xml) = run_with_report(&bin, &cfg);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(xml.contains("type=\"db_connection\""), "{xml}");
+}
+
+#[test]
+fn a_literal_mistake_in_an_assertion_stops_the_run_before_the_first_request() {
+    let bin = require_bddkit!();
+    let cfg = keys_project(
+        "mistake",
+        r#"    Then etcd key "<<prefix>>k" should have:
+      | field  | value |
+      | colour | 1     |
+"#,
+    );
+    let (code, text, _) = run_with_report(&bin, &cfg);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("unknown field \"colour\""), "{text}");
+}
