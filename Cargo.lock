@@ -84,10 +84,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bddkit-crate-json"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98c855e4714b28cfd519d93c2b0c78d3ea0c37e83ef19ce4aa5cb90cecd6d06"
+dependencies = [
+ "regex",
+ "serde_json",
+]
+
+[[package]]
 name = "bddkit-etcd"
 version = "0.0.0"
 dependencies = [
+ "bddkit-crate-json",
  "etcd-client",
+ "regex",
  "serde_json",
  "tokio",
  "tonic",

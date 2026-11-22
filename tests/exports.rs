@@ -27,13 +27,12 @@ fn the_manifest_and_the_step_list_are_what_the_host_loads() {
     let manifest = call(bddkit_manifest());
     assert_eq!(manifest["groups"], json!(["etcd"]));
     let steps = call(bddkit_list_steps());
-    assert_eq!(steps.as_array().expect("an array").len(), 6);
-    assert!(
-        steps
-            .as_array()
-            .expect("an array")
-            .iter()
-            .all(|s| s["group"] == "etcd")
+    let steps = steps.as_array().expect("an array");
+    assert_eq!(steps.len(), 17);
+    assert!(steps.iter().all(|s| s["group"] == "etcd"));
+    assert_eq!(
+        steps.iter().filter(|s| s["kind"] == "assertion").count(),
+        11
     );
 }
 

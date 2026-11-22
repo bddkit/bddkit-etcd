@@ -2,6 +2,7 @@
 //! server. Written against docs/plugin-authoring.md; it must never need the
 //! host's source.
 
+mod check;
 mod client;
 pub mod config;
 mod error;

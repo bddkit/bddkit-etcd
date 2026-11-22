@@ -18,7 +18,7 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use bddkit_etcd::*;
-use common::{call, cstr, request};
+use common::{Handle, call, cstr};
 use serde_json::{Value, json};
 
 static SERVER: RwLock<()> = RwLock::new(());
@@ -29,40 +29,6 @@ const GET: u32 = 2;
 const DELETE_KEY: u32 = 3;
 const DELETE_PREFIX: u32 = 4;
 const DELETE_ALL: u32 = 5;
-
-/// A handle that is dropped with it.
-struct Handle(u64);
-
-impl Handle {
-    fn new(config: &Value) -> Self {
-        let reply = call(bddkit_init_instance(request(config).as_ptr()));
-        Self(reply["handle"].as_u64().expect("handle"))
-    }
-
-    fn live() -> Self {
-        Self::new(&json!({"endpoints": common::etcd_endpoint()}))
-    }
-
-    fn dispatch(&self, step: u32, args: &[&str], docstring: Option<&str>, debug: bool) -> Value {
-        let request =
-            json!({"args": args, "docstring": docstring, "debug": debug, "instance": "main"});
-        call(bddkit_dispatch(self.0, step, cstr(&request).as_ptr()))
-    }
-
-    fn run(&self, step: u32, args: &[&str]) -> Value {
-        self.dispatch(step, args, None, false)
-    }
-
-    fn context(&self) -> Value {
-        call(bddkit_failure_context(self.0))
-    }
-}
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        call(bddkit_drop_instance(self.0));
-    }
-}
 
 fn prefix(test: &str) -> String {
     format!("/bddkit-etcd/{test}/{}/", std::process::id())

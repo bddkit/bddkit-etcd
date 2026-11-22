@@ -22,6 +22,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 etcd-client = { version = "=0.21.1", default-features = false, features = ["tls-ring", "tls-native-roots"] }
+bddkit-crate-json = "0.1"
+regex = "1.13"
 serde_json = "1.0"
 # `Status`, `Code` and the `Uri` the addresses are checked with: the version
 # etcd-client already builds on.

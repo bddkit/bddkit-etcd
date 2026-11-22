@@ -34,6 +34,10 @@ impl Class {
 pub struct StepError {
     pub class: Class,
     pub message: String,
+    /// The reply is `not_yet`, not `fatal`: a fresh read may still change it.
+    /// Only an assertion's error may carry it, the host fails an action that
+    /// answers `not_yet`.
+    pub retry: bool,
 }
 
 impl StepError {
@@ -41,7 +45,25 @@ impl StepError {
         Self {
             class,
             message: message.into(),
+            retry: false,
         }
+    }
+
+    /// An assertion that may hold on a later attempt.
+    pub fn not_yet(class: Class, message: impl Into<String>) -> Self {
+        Self {
+            retry: true,
+            ..Self::new(class, message)
+        }
+    }
+
+    /// What an assertion makes of a failure to reach or to be answered by the
+    /// server: another attempt may find it up. The other classes keep what
+    /// they were born with.
+    #[must_use]
+    pub fn polled(mut self) -> Self {
+        self.retry |= matches!(self.class, Class::DbConnection | Class::DbStatement);
+        self
     }
 
     pub fn input(message: impl Into<String>) -> Self {
@@ -62,6 +84,17 @@ impl fmt::Display for StepError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_failure_of_the_server_becomes_retryable_when_polled() {
+        for class in [Class::DbConnection, Class::DbStatement] {
+            assert!(StepError::new(class, "x").polled().retry);
+        }
+        for class in [Class::Assertion, Class::Input] {
+            assert!(!StepError::new(class, "x").polled().retry);
+        }
+        assert!(StepError::not_yet(Class::Assertion, "x").polled().retry);
+    }
 
     #[test]
     fn a_class_is_spelled_as_the_host_expects() {
