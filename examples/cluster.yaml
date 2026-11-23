@@ -1,0 +1,24 @@
+# Three etcd processes that the exec plugin starts and kills, so a scenario can
+# break the cluster. It needs the exec plugin (`bddkit plugin install exec`)
+# and the `etcd` and `etcdctl` binaries of an etcd release on PATH, and no
+# server: the nodes listen on 127.0.0.1:25001 to 25003 (clients) and 25011 to
+# 25013 (peers). Run from the repository root:
+#   bddkit run --config examples/cluster.yaml
+paths: [examples/cluster]
+
+default_etcd: n1
+
+resources:
+  exec:
+    local:
+      # A killed node gets no time to hand its leadership over: the cluster has
+      # to notice that it is gone.
+      stop_grace_secs: 0
+  # One endpoint each: a node step asks one node, never whichever a client picks.
+  etcd:
+    n1:
+      endpoints: http://127.0.0.1:25001
+    n2:
+      endpoints: http://127.0.0.1:25002
+    n3:
+      endpoints: http://127.0.0.1:25003

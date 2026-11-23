@@ -5,6 +5,8 @@
 //! They need the two plain servers of `docker-compose.yml` (`etcd` on 2379 and
 //! `etcd-b` on 12379): the addresses are written in `examples/*.yaml`, as a
 //! reader would copy them. Without the servers they skip, except under `CI`.
+//! The failover example needs no server: it needs etcd binaries and the `exec`
+//! plugin, see its test.
 
 #![allow(
     clippy::expect_used,
@@ -147,4 +149,34 @@ fn the_failing_suite_fails_each_scenario_with_its_class_and_text() {
         assert!(output.contains(PASSWORD), "{name}\n{output}");
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The failover example starts its own nodes, so it needs binaries and not
+/// servers: `etcd` and `etcdctl` (the directory of `BDDKIT_TEST_ETCD_BIN` or
+/// `PATH`) and the `exec` plugin (`BDDKIT_EXEC_PLUGIN`).
+#[test]
+fn the_failover_example_passes_on_three_real_nodes() {
+    let bin = require_bddkit!();
+    let etcd = require_etcd_bin!();
+    let Some(exec) = common::exec_plugin() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "BDDKIT_EXEC_PLUGIN does not name the exec plugin, and CI must not skip"
+        );
+        eprintln!("SKIP: set BDDKIT_EXEC_PLUGIN to libbddkit_exec.so");
+        return;
+    };
+    let mut dirs = vec![etcd.parent().expect("a directory").to_path_buf()];
+    dirs.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let out = std::process::Command::new(&bin)
+        .args(["run", "--config", "examples/cluster.yaml", "--bddkit-dir"])
+        .arg(common::lock_dir_with_exec(&exec))
+        .env("PATH", std::env::join_paths(dirs).expect("a PATH"))
+        .output()
+        .expect("bddkit");
+    let text = combined(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("scenarios: 2, failed: 0"), "{text}");
 }

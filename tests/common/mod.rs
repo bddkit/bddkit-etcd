@@ -50,6 +50,15 @@ macro_rules! require_bddkit {
     };
 }
 
+/// The `exec` plugin library that the failover example starts its nodes with:
+/// `BDDKIT_EXEC_PLUGIN` names `libbddkit_exec.so` (or the library of the platform).
+pub fn exec_plugin() -> Option<PathBuf> {
+    std::env::var("BDDKIT_EXEC_PLUGIN")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+}
+
 pub fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
@@ -58,7 +67,18 @@ pub fn root() -> &'static Path {
 /// handed to `--bddkit-dir`.
 pub fn lock_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
+    DIR.get_or_init(|| build_lock("e2e", None))
+}
+
+/// The same with the `exec` plugin beside it, for the failover example only:
+/// the other tests run without it.
+pub fn lock_dir_with_exec(exec: &Path) -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| build_lock("failover", Some(exec)))
+}
+
+fn build_lock(name: &str, exec: Option<&Path>) -> PathBuf {
+    {
         let out = Command::new(env!("CARGO"))
             .arg("build")
             .current_dir(root())
@@ -74,15 +94,15 @@ pub fn lock_dir() -> &'static Path {
             std::env::consts::DLL_PREFIX,
             std::env::consts::DLL_SUFFIX
         ));
-        let dir = std::env::temp_dir().join(format!("bddkit-etcd-e2e-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("bddkit-etcd-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(
-            dir.join("plugins.yaml"),
-            format!("plugin:\n  - name: etcd\n    path: {}\n", library.display()),
-        )
-        .expect("lock");
+        let mut lock = format!("plugin:\n  - name: etcd\n    path: {}\n", library.display());
+        if let Some(exec) = exec {
+            lock.push_str(&format!("  - name: exec\n    path: {}\n", exec.display()));
+        }
+        std::fs::write(dir.join("plugins.yaml"), lock).expect("lock");
         dir
-    })
+    }
 }
 
 pub fn bddkit(bin: &Path, args: &[&str]) -> Output {
