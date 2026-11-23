@@ -273,7 +273,9 @@ pub fn plan(step: Step, request: &Request) -> Result<Check, StepError> {
         | Step::WatchedPut
         | Step::WatchedDelete
         | Step::WatchedCount
-        | Step::WatchedEvents => Err(StepError::input("not an assertion")),
+        | Step::WatchedEvents
+        | Step::WatchResumed
+        | Step::WatchResumedTimes => Err(StepError::input("not an assertion")),
     }
 }
 

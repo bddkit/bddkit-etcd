@@ -115,7 +115,9 @@ pub fn plan(step: Step, request: &Request, endpoints: usize) -> Result<Node, Ste
         | Step::WatchedPut
         | Step::WatchedDelete
         | Step::WatchedCount
-        | Step::WatchedEvents => return Err(StepError::input("not a node step")),
+        | Step::WatchedEvents
+        | Step::WatchResumed
+        | Step::WatchResumedTimes => return Err(StepError::input("not a node step")),
     })
 }
 
