@@ -5,9 +5,12 @@
 //! same events and the new ones.
 //!
 //! A watch belongs to the instance that opened it and ends with the scenario
-//! (`Watches::stop_all`). Until a stream that broke can be resumed, a break is
-//! a terminal state, like a cancellation by the server or a full buffer: it
-//! is kept with its reason, and the next assertion on the watch fails with it.
+//! (`Watches::stop_all`). A stream that breaks (a transport error, a close, a
+//! cancel that is not final) is opened again from where it left off, with a
+//! backoff, until the scenario ends (`resume.rs`); to the assertions it is a
+//! watch that has not received more yet. A final state, a cancellation for
+//! compaction or permission, a full buffer or an event out of order, is kept
+//! with its reason, and the next assertion on the watch fails with it.
 
 use std::time::Duration;
 
@@ -32,6 +35,16 @@ const SHOWN_EVENTS: usize = 10;
 // ponytail: a timer, not a protocol exchange; a server slower than this still
 // ends the watch, and the first assertion on it says why.
 const REPLAY_GRACE: Duration = Duration::from_millis(500);
+
+/// What the task does after a message of the stream.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    Read,
+    /// The stream is over for now; open it again.
+    Reopen,
+    /// The watch ended for good.
+    Stop,
+}
 
 const COLUMNS: [&str; 6] = [
     "type",
@@ -135,21 +148,53 @@ pub struct State {
     limit: usize,
     /// The revision of the answer that confirmed the watch.
     revision: i64,
+    /// The `from revision` the watch was opened with, if any.
+    from: Option<i64>,
     events: Vec<Event>,
     violation: Option<String>,
     ending: Option<Ending>,
+    /// How many times the server confirmed a new stream after a break.
+    resumes: u64,
+    /// Why the stream is down and being opened again; `None` while it flows.
+    broken: Option<Failure>,
+    /// The last break, kept after the watch resumed.
+    last_error: Option<String>,
 }
 
 impl State {
-    fn new(target: String, limit: usize, revision: i64) -> Self {
+    fn new(target: String, limit: usize, revision: i64, from: Option<i64>) -> Self {
         Self {
             target,
             limit,
             revision,
+            from,
             events: Vec::new(),
             violation: None,
             ending: None,
+            resumes: 0,
+            broken: None,
+            last_error: None,
         }
+    }
+
+    /// The stream is down: kept with its reason, and the task opens it again.
+    fn broke(&mut self, class: Class, message: impl Into<String>) -> Next {
+        let message = message.into();
+        self.last_error = Some(message.clone());
+        self.broken = Some(Failure { class, message });
+        Next::Reopen
+    }
+
+    /// Where a resumed stream starts: right after the last event, so that no
+    /// write of the gap is lost and none is sent twice. With no event yet, the
+    /// replay the watch was opened with if it had one (its events may not have
+    /// arrived), else the revision of the answer that confirmed it.
+    fn resume_from(&self) -> i64 {
+        self.events
+            .last()
+            .map(|event| event.mod_revision + 1)
+            .or(self.from)
+            .unwrap_or(self.revision + 1)
     }
 
     fn stopped(&self) -> bool {
@@ -226,38 +271,47 @@ impl State {
         }
     }
 
-    /// One message of the stream. `false` when the task is to stop.
+    /// One message of the stream.
     fn apply(
         &mut self,
         message: Result<Option<WatchResponse>, etcd_client::Error>,
         tls: bool,
-    ) -> bool {
+    ) -> Next {
+        // Nothing is read, or counted, after the watch has ended for good.
+        if self.stopped() {
+            return Next::Stop;
+        }
         let response = match message {
             Ok(Some(response)) => response,
             Ok(None) => {
-                self.fail(Class::DbConnection, "the server closed the watch stream");
-                return false;
+                return self.broke(Class::DbConnection, "the server closed the watch stream");
             }
             Err(error) => {
                 // A request that failed says what the server answered; it is not
                 // a refused password.
                 let failure = request_failure(&error, tls);
-                self.fail(
+                return self.broke(
                     failure.class,
                     format!("the watch stream broke: {}", failure.message),
                 );
-                return false;
             }
         };
         if response.canceled() {
-            self.fail(
-                Class::DbStatement,
-                format!(
-                    "the server cancelled the watch: {}",
-                    cancel_reason(&response)
-                ),
+            let message = format!(
+                "the server cancelled the watch: {}",
+                cancel_reason(&response)
             );
-            return false;
+            if cancel_is_final(response.compact_revision(), response.cancel_reason()) {
+                self.fail(Class::DbStatement, message);
+                return Next::Stop;
+            }
+            return self.broke(Class::DbStatement, message);
+        }
+        if response.created() {
+            // Only a resumed stream sends it here: `open` took the first one.
+            self.resumes += 1;
+            self.broken = None;
+            return Next::Read;
         }
         let events: Result<Vec<Event>, String> =
             response.events().iter().map(Event::from_client).collect();
@@ -265,7 +319,11 @@ impl State {
             Ok(events) => self.accept(events),
             Err(why) => self.violation = Some(why),
         }
-        !self.stopped()
+        if self.stopped() {
+            Next::Stop
+        } else {
+            Next::Read
+        }
     }
 
     fn describe(&self) -> Value {
@@ -280,6 +338,9 @@ impl State {
             "state": state,
             "violation": self.violation,
             "created_at_revision": self.revision,
+            "resumes": self.resumes,
+            "reconnecting": self.broken.is_some() && self.ending.is_none(),
+            "last_error": self.last_error,
             "events": self.events.len(),
             "last_revision": self.events.last().map(|event| event.mod_revision),
             "last_events": self.events[first..].iter().map(Event::shown).collect::<Vec<_>>(),
@@ -296,6 +357,15 @@ impl State {
         }
         record.scan().to_vec()
     }
+}
+
+/// A cancel that no new stream can undo: the events of the gap are gone
+/// (compaction) or the watcher may not read them (permission). Any other
+/// cancel, a missing leader under `require_leader` for one, is a break.
+// ponytail: the compaction is told by `compact_revision`, but the protocol has
+// no field for a permission, so that one is told by the reason's text.
+fn cancel_is_final(compact_revision: i64, reason: &str) -> bool {
+    compact_revision != 0 || reason.contains("permission")
 }
 
 fn cancel_reason(response: &WatchResponse) -> String {
@@ -324,10 +394,17 @@ pub struct Row {
 
 #[derive(Debug)]
 pub enum Expect {
-    Put { key: String, value: String },
-    Delete { key: String },
+    Put {
+        key: String,
+        value: String,
+    },
+    Delete {
+        key: String,
+    },
     Count(u64),
     Table(Vec<Row>),
+    /// At least once, or exactly this many times.
+    Resumed(Option<u64>),
 }
 
 #[derive(Debug)]
@@ -381,6 +458,13 @@ fn watch_revision(text: &str) -> Result<i64, StepError> {
     }
 }
 
+fn count(request: &Request, index: usize) -> Result<u64, StepError> {
+    request
+        .arg(index)?
+        .parse()
+        .map_err(|_| StepError::input(format!("\"{}\" is not a count", request.args[index])))
+}
+
 fn nonempty(text: &str, what: &str) -> Result<String, StepError> {
     if text.is_empty() {
         return Err(StepError::input(format!("the {what} is empty")));
@@ -422,9 +506,15 @@ pub fn plan(step: Step, request: &Request) -> Result<Watch, StepError> {
         },
         Step::WatchedCount => Watch::Check {
             name: name(0)?,
-            expect: Expect::Count(request.arg(1)?.parse().map_err(|_| {
-                StepError::input(format!("\"{}\" is not a count", request.args[1]))
-            })?),
+            expect: Expect::Count(count(request, 1)?),
+        },
+        Step::WatchResumed => Watch::Check {
+            name: name(0)?,
+            expect: Expect::Resumed(None),
+        },
+        Step::WatchResumedTimes => Watch::Check {
+            name: name(0)?,
+            expect: Expect::Resumed(Some(count(request, 1)?)),
         },
         Step::WatchedEvents => Watch::Check {
             name: name(0)?,
@@ -593,6 +683,7 @@ impl State {
                 ))),
             },
             Expect::Table(rows) => self.table(name, rows, record),
+            Expect::Resumed(times) => self.resumed(name, *times),
         };
         // A cancelled watch receives nothing more: what it lacks it will
         // always lack, and waiting for it would only run the polling out.
@@ -603,7 +694,36 @@ impl State {
                     error.message
                 )))
             }
+            // A stream that is down is why the wait is long: say so, and keep
+            // the class of what broke it, as a polling that runs out does.
+            Err(error) if error.retry => Err(self.broken.as_ref().map_or_else(
+                || error.clone(),
+                |broken| {
+                    StepError::not_yet(
+                        broken.class,
+                        format!(
+                            "{}; the stream is down and being opened again: {}",
+                            error.message, broken.message
+                        ),
+                    )
+                },
+            )),
             other => other,
+        }
+    }
+
+    fn resumed(&self, name: &str, times: Option<u64>) -> Result<(), StepError> {
+        let held = self.resumes;
+        match times {
+            None if held > 0 => Ok(()),
+            Some(want) if held == want => Ok(()),
+            Some(want) if held > want => Err(StepError::assertion(format!(
+                "etcd watch \"{name}\" has been resumed {held} times, expected {want}, and a resume does not go away"
+            ))),
+            _ => Err(miss(format!(
+                "etcd watch \"{name}\" has been resumed {held} times, expected {}",
+                times.map_or("at least once".to_string(), |want| want.to_string())
+            ))),
         }
     }
 
@@ -661,263 +781,10 @@ impl State {
     }
 }
 
+mod resume;
 mod run;
 
 pub use run::{Watches, perform};
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn put(key: &str, value: &str, rev: i64) -> Event {
-        Event {
-            kind: Kind::Put,
-            key: key.as_bytes().to_vec(),
-            value: value.as_bytes().to_vec(),
-            prev_value: Vec::new(),
-            mod_revision: rev,
-            version: 1,
-        }
-    }
-
-    fn delete(key: &str, rev: i64) -> Event {
-        Event {
-            kind: Kind::Delete,
-            key: key.as_bytes().to_vec(),
-            value: Vec::new(),
-            prev_value: b"old".to_vec(),
-            mod_revision: rev,
-            version: 0,
-        }
-    }
-
-    fn state(events: Vec<Event>) -> State {
-        let mut state = State::new("prefix \"/p/\"".to_string(), 100, 1);
-        state.accept(events);
-        state
-    }
-
-    fn row(kind: Kind, key: &str, value: Option<&str>) -> Row {
-        Row {
-            kind: Some(kind),
-            key: Some(key.to_string()),
-            value: value.map(str::to_string),
-            ..Row::default()
-        }
-    }
-
-    fn record() -> Record {
-        Record::new("CheckWatch", "w", "main", json!({}))
-    }
-
-    fn judged(state: &State, expect: &Expect) -> Result<(), StepError> {
-        state.judge("w", expect, &mut record())
-    }
-
-    #[test]
-    fn a_history_that_is_a_beginning_of_the_table_is_not_yet_and_any_other_is_final() {
-        let table = |n: usize| {
-            Expect::Table(
-                [
-                    row(Kind::Put, "/p/a", Some("1")),
-                    row(Kind::Delete, "/p/a", None),
-                ]
-                .into_iter()
-                .take(n)
-                .collect(),
-            )
-        };
-        let none = state(vec![]);
-        assert!(judged(&none, &table(2)).expect_err("short").retry);
-        let one = state(vec![put("/p/a", "1", 5)]);
-        assert!(judged(&one, &table(2)).expect_err("short").retry);
-        let both = state(vec![put("/p/a", "1", 5), delete("/p/a", 6)]);
-        assert!(judged(&both, &table(2)).is_ok());
-        // One event too many: it will not go away.
-        let extra = judged(&both, &table(1)).expect_err("extra");
-        assert!(!extra.retry && extra.message.contains("first extra one is a DELETE"));
-        // A different event in the range of the table.
-        let other = state(vec![put("/p/a", "2", 5)]);
-        let different = judged(&other, &table(2)).expect_err("different");
-        assert!(!different.retry, "{different}");
-        assert!(different.message.contains("value is \"2\", expected \"1\""));
-    }
-
-    #[test]
-    fn a_count_is_not_yet_below_and_final_above() {
-        let two = state(vec![put("/p/a", "1", 5), put("/p/b", "1", 6)]);
-        assert!(judged(&two, &Expect::Count(2)).is_ok());
-        assert!(judged(&two, &Expect::Count(3)).expect_err("fewer").retry);
-        assert!(!judged(&two, &Expect::Count(1)).expect_err("more").retry);
-    }
-
-    #[test]
-    fn a_put_or_a_delete_is_found_anywhere_in_the_history_and_waited_for_otherwise() {
-        let history = state(vec![
-            put("/p/a", "1", 5),
-            delete("/p/b", 6),
-            put("/p/a", "2", 7),
-        ]);
-        let found = |kind, key: &str, value: Option<&str>| {
-            history.any("w", kind, key, value.map(str::to_string).as_ref())
-        };
-        assert!(found(Kind::Put, "/p/a", Some("1")).is_ok());
-        assert!(found(Kind::Put, "/p/a", Some("2")).is_ok());
-        assert!(found(Kind::Delete, "/p/b", None).is_ok());
-        for missing in [
-            found(Kind::Put, "/p/a", Some("3")),
-            found(Kind::Delete, "/p/a", None),
-            found(Kind::Put, "/p/b", Some("")),
-        ] {
-            assert!(missing.expect_err("absent").retry);
-        }
-    }
-
-    #[test]
-    fn an_event_out_of_order_or_seen_twice_fails_every_later_assertion() {
-        let mut backwards = state(vec![put("/p/a", "1", 5), put("/p/b", "1", 4)]);
-        let error = judged(&backwards, &Expect::Count(2)).expect_err("violation");
-        assert!(!error.retry && error.class == Class::Assertion);
-        assert!(error.message.contains("mod_revision 4, after"), "{error}");
-        // The history stops growing once it cannot be trusted.
-        backwards.accept(vec![put("/p/c", "1", 9)]);
-        assert_eq!(backwards.events.len(), 1);
-        let twice = state(vec![put("/p/a", "1", 5), put("/p/a", "1", 5)]);
-        assert!(
-            twice
-                .violation
-                .as_deref()
-                .is_some_and(|v| v.contains("arrived twice"))
-        );
-        // The same key at a later revision, and another key at the same one, are fine.
-        let fine = state(vec![
-            put("/p/a", "1", 5),
-            put("/p/b", "1", 5),
-            put("/p/a", "2", 6),
-        ]);
-        assert!(fine.violation.is_none());
-    }
-
-    #[test]
-    fn a_full_buffer_stops_the_watch_and_names_the_limit() {
-        let mut full = State::new("key \"/k\"".to_string(), 2, 1);
-        full.accept(vec![
-            put("/k", "1", 2),
-            put("/k", "2", 3),
-            put("/k", "3", 4),
-        ]);
-        assert_eq!(full.events.len(), 2, "nothing is dropped, nothing is added");
-        let error = judged(&full, &Expect::Count(2)).expect_err("stopped");
-        assert!(
-            !error.retry && error.message.contains("watch_buffer_events (2)"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn an_ended_watch_is_final_for_the_assertion_whatever_the_class_of_its_reason() {
-        let mut broke = state(vec![]);
-        broke.fail(Class::DbConnection, "the watch stream broke: gone");
-        let error = judged(&broke, &Expect::Count(0)).expect_err("stopped");
-        assert!(!error.retry);
-        assert_eq!(error.class, Class::DbConnection);
-        // A cancelled watch still answers from what it received.
-        let mut cancelled = state(vec![put("/p/a", "1", 5)]);
-        cancelled.ending = Some(Ending::Cancelled);
-        assert!(judged(&cancelled, &Expect::Count(1)).is_ok());
-    }
-
-    #[test]
-    fn the_columns_of_a_table_are_the_ones_it_names() {
-        let table = |rows: &[&[&str]]| -> Vec<Vec<String>> {
-            rows.iter()
-                .map(|r| r.iter().map(ToString::to_string).collect())
-                .collect()
-        };
-        let ok = table(&[
-            &["mod_revision", "type", "prev_value"],
-            &["7", "DELETE", "old"],
-        ]);
-        let rows = rows(Some(&ok)).expect("rows");
-        assert_eq!(rows[0].mod_revision, Some(7));
-        assert_eq!(rows[0].kind, Some(Kind::Delete));
-        assert!(rows[0].key.is_none());
-        assert!(
-            rows[0]
-                .differences(&delete("/k", 7), &mut record())
-                .is_empty()
-        );
-        assert_eq!(
-            rows[0].differences(&delete("/k", 8), &mut record()),
-            ["mod_revision is 8, expected 7"]
-        );
-        for (bad, said) in [
-            (
-                table(&[&["key", "rev"], &["/k", "1"]]),
-                "unknown table column \"rev\"",
-            ),
-            (table(&[&["type"], &["put"]]), "unknown event type \"put\""),
-            (table(&[&["version"], &["x"]]), "not a whole number"),
-            (table(&[&["key"]]), "no rows"),
-        ] {
-            let error = super::rows(Some(&bad)).expect_err("refused");
-            assert!(error.contains(said), "{error}");
-        }
-    }
-
-    #[test]
-    fn a_literal_that_cannot_work_is_refused_before_the_run_and_a_slot_is_not() {
-        let validate = |step, args: &[&str]| validate(step, &Request::for_test(args));
-        assert!(validate(Step::WatchKey, &["/k", "cfg"]).is_ok());
-        assert!(validate(Step::WatchKey, &["", "cfg"]).is_err());
-        assert!(validate(Step::WatchKey, &["<<k>>", "<<n>>"]).is_ok());
-        assert!(validate(Step::WatchPrefix, &["", "cfg"]).is_err());
-        assert!(validate(Step::WatchKey, &["/k", "not a name"]).is_err());
-        assert!(validate(Step::WatchCancel, &["bad-name"]).is_err());
-        assert!(validate(Step::WatchKeyFrom, &["/k", "cfg", "0"]).is_err());
-        assert!(validate(Step::WatchKeyFrom, &["/k", "cfg", "5"]).is_ok());
-    }
-
-    #[test]
-    fn a_name_the_instance_does_not_know_is_input_and_never_needs_a_server() {
-        let watches = Watches::default();
-        assert_eq!(
-            watches.state("nope").err().map(|e| e.class),
-            Some(Class::Input)
-        );
-    }
-
-    #[test]
-    fn a_stream_that_ends_or_breaks_stops_the_watch_and_a_refusal_is_not_a_bad_password() {
-        let mut closed = state(vec![]);
-        assert!(!closed.apply(Ok(None), false));
-        assert_eq!(closed.failure().expect("ended").class, Class::DbConnection);
-        let mut refused = state(vec![]);
-        let status = tonic::Status::new(tonic::Code::InvalidArgument, "etcdserver: nope");
-        assert!(!refused.apply(Err(etcd_client::Error::GRpcStatus(status)), false));
-        let failure = refused.failure().expect("ended");
-        assert_eq!(failure.class, Class::DbStatement);
-        assert!(
-            failure.message.contains("answered with an error"),
-            "{}",
-            failure.message
-        );
-        assert!(
-            !failure.message.contains("credentials"),
-            "{}",
-            failure.message
-        );
-    }
-
-    #[test]
-    fn a_cancelled_watch_turns_a_miss_into_a_final_failure() {
-        let mut cancelled = state(vec![put("/p/a", "1", 5)]);
-        cancelled.ending = Some(Ending::Cancelled);
-        let error = judged(&cancelled, &Expect::Count(2)).expect_err("never");
-        assert!(
-            !error.retry && error.message.contains("nothing more will arrive"),
-            "{error}"
-        );
-        assert!(judged(&cancelled, &Expect::Delete { key: "/p/a".into() }).is_err());
-    }
-}
+mod tests;

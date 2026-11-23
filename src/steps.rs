@@ -53,10 +53,12 @@ pub enum Step {
     WatchedDelete,
     WatchedCount,
     WatchedEvents,
+    WatchResumed,
+    WatchResumedTimes,
 }
 
 /// In the order the host indexes them.
-const ALL: [Step; 39] = [
+const ALL: [Step; 41] = [
     Step::Put,
     Step::PutDocString,
     Step::Get,
@@ -96,6 +98,8 @@ const ALL: [Step; 39] = [
     Step::WatchedDelete,
     Step::WatchedCount,
     Step::WatchedEvents,
+    Step::WatchResumed,
+    Step::WatchResumedTimes,
 ];
 
 struct Spec {
@@ -166,7 +170,9 @@ impl Step {
             | Self::WatchedPut
             | Self::WatchedDelete
             | Self::WatchedCount
-            | Self::WatchedEvents => true,
+            | Self::WatchedEvents
+            | Self::WatchResumed
+            | Self::WatchResumedTimes => true,
         }
     }
 
@@ -205,6 +211,8 @@ impl Step {
                 | Self::WatchedDelete
                 | Self::WatchedCount
                 | Self::WatchedEvents
+                | Self::WatchResumed
+                | Self::WatchResumedTimes
         )
     }
 
@@ -225,36 +233,12 @@ impl Step {
 
     fn spec(self) -> Spec {
         let (expression, description, sets_vars) = match self {
-            Self::Put => (
-                r#"I put etcd key "{key}" with value "{value}""#,
-                "writes a key and stores the revision of the response in etcd_revision",
-                REVISION,
-            ),
-            Self::PutDocString => (
-                r#"I put etcd key "{key}" with value:"#,
-                "writes a key whose value is the doc string below, and stores the revision in etcd_revision",
-                REVISION,
-            ),
-            Self::Get => (
-                r#"I get etcd key "{key}""#,
-                "reads a key (linearizable) into etcd_value and its revisions, version and lease; fails when the key does not exist",
-                READ,
-            ),
-            Self::DeleteKey => (
-                r#"I delete etcd key "{key}""#,
-                "deletes a key and stores etcd_revision and the number of keys deleted in etcd_deleted",
-                DELETED,
-            ),
-            Self::DeletePrefix => (
-                r#"I delete etcd keys with prefix "{prefix}""#,
-                "deletes every key under a prefix; an empty prefix is refused, it would delete the whole server",
-                DELETED,
-            ),
-            Self::DeleteAll => (
-                "I delete all etcd keys",
-                "clears the whole server, with no awareness of files running in parallel",
-                DELETED,
-            ),
+            Self::Put
+            | Self::PutDocString
+            | Self::Get
+            | Self::DeleteKey
+            | Self::DeletePrefix
+            | Self::DeleteAll => self.action_spec(),
             Self::Exists => (
                 r#"etcd key "{key}" should exist"#,
                 "reads the key again on every attempt; passes when it exists",
@@ -317,12 +301,51 @@ impl Step {
             | Self::WatchedPut
             | Self::WatchedDelete
             | Self::WatchedCount
-            | Self::WatchedEvents => self.watch_spec(),
+            | Self::WatchedEvents
+            | Self::WatchResumed
+            | Self::WatchResumedTimes => self.watch_spec(),
         };
         Spec {
             expression,
             description,
             sets_vars,
+        }
+    }
+
+    /// The actions on keys, kept apart so `spec` stays short.
+    fn action_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
+        match self {
+            Self::Put => (
+                r#"I put etcd key "{key}" with value "{value}""#,
+                "writes a key and stores the revision of the response in etcd_revision",
+                REVISION,
+            ),
+            Self::PutDocString => (
+                r#"I put etcd key "{key}" with value:"#,
+                "writes a key whose value is the doc string below, and stores the revision in etcd_revision",
+                REVISION,
+            ),
+            Self::Get => (
+                r#"I get etcd key "{key}""#,
+                "reads a key (linearizable) into etcd_value and its revisions, version and lease; fails when the key does not exist",
+                READ,
+            ),
+            Self::DeleteKey => (
+                r#"I delete etcd key "{key}""#,
+                "deletes a key and stores etcd_revision and the number of keys deleted in etcd_deleted",
+                DELETED,
+            ),
+            Self::DeletePrefix => (
+                r#"I delete etcd keys with prefix "{prefix}""#,
+                "deletes every key under a prefix; an empty prefix is refused, it would delete the whole server",
+                DELETED,
+            ),
+            Self::DeleteAll => (
+                "I delete all etcd keys",
+                "clears the whole server, with no awareness of files running in parallel",
+                DELETED,
+            ),
+            _ => unreachable!("not an action on keys"),
         }
     }
 
@@ -436,6 +459,16 @@ impl Step {
             Self::WatchedEvents => (
                 r#"etcd watch "{name}" should have received events:"#,
                 "passes when the watch's whole history, in order, is the rows of a table; the header picks the columns out of type (PUT or DELETE), key, value, prev_value (empty when the key had none), mod_revision and version; not yet while the history is a beginning of the rows, a failure once it differs from them",
+                NONE,
+            ),
+            Self::WatchResumed => (
+                r#"etcd watch "{name}" should have been resumed"#,
+                "passes once the watch's stream broke (the node died, the leader was lost) and the server confirmed a new one, which the watch opens by itself from the revision after its last event, so no write of the gap is lost; not yet while it never broke, so a scenario cannot pass on a stream that never did",
+                NONE,
+            ),
+            Self::WatchResumedTimes => (
+                r#"etcd watch "{name}" should have been resumed {n:uint} times"#,
+                "passes when the server confirmed exactly this many new streams; not yet while there are fewer, a failure once there are more",
                 NONE,
             ),
             _ => unreachable!("not a watch step"),
@@ -571,7 +604,7 @@ mod tests {
             let found = Step::from_index(u32::try_from(index).expect("small")).expect("step");
             assert!(found == *step);
         }
-        assert!(Step::from_index(39).is_none());
+        assert!(Step::from_index(41).is_none());
     }
 
     #[test]

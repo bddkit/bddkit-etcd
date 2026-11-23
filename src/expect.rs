@@ -155,7 +155,9 @@ pub fn plan(step: Step, request: &Request) -> Result<Expect, StepError> {
         | Step::WatchedPut
         | Step::WatchedDelete
         | Step::WatchedCount
-        | Step::WatchedEvents => return Err(StepError::input("not an accept / refuse step")),
+        | Step::WatchedEvents
+        | Step::WatchResumed
+        | Step::WatchResumedTimes => return Err(StepError::input("not an accept / refuse step")),
     };
     Ok(Expect { call, wanted })
 }

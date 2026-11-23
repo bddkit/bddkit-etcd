@@ -10,7 +10,8 @@ use etcd_client::{WatchOptions, WatchStream};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
-use super::{Create, Ending, REPLAY_GRACE, State, Watch, cancel_reason};
+use super::resume::{FIRST_WAIT, Resume, reopen};
+use super::{Create, Ending, Next, REPLAY_GRACE, State, Watch, cancel_reason};
 use crate::client::request_failure;
 use crate::error::{Class, StepError};
 use crate::evidence::Record;
@@ -49,15 +50,40 @@ impl Drop for Alive {
 }
 
 /// Nothing can panic under these locks (a push, an assignment).
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-async fn follow(mut stream: WatchStream, state: Arc<Mutex<State>>, tls: bool, _alive: Alive) {
+/// Reads the stream into the state. A stream that breaks is opened again
+/// until the watch ends for good (or the task is aborted); `stream` is `None`
+/// when it is already over.
+async fn follow(
+    mut stream: Option<WatchStream>,
+    state: Arc<Mutex<State>>,
+    resume: Resume,
+    _alive: Alive,
+) {
+    let mut wait = FIRST_WAIT;
     loop {
-        let message = stream.message().await;
-        if !locked(&state).apply(message, tls) {
-            return;
+        let (open, message) = match stream.take() {
+            Some(mut open) => {
+                let message = open.message().await;
+                (open, message)
+            }
+            None => reopen(&resume, &state, &mut wait).await,
+        };
+        let mut state = locked(&state);
+        match state.apply(message, resume.tls) {
+            Next::Read => {
+                stream = Some(open);
+                // A stream that flows again starts the next break from the
+                // short wait.
+                if state.broken.is_none() {
+                    wait = FIRST_WAIT;
+                }
+            }
+            Next::Reopen => {}
+            Next::Stop => return,
         }
     }
 }
@@ -256,18 +282,28 @@ async fn open(
         target,
         usize::try_from(instance.config.watch_buffer_events).unwrap_or(usize::MAX),
         revision,
+        create.from,
     );
+    let mut next = Next::Read;
     if create.from.is_some()
         && let Ok(message) = tokio::time::timeout(REPLAY_GRACE, stream.message()).await
     {
-        state.apply(message, tls);
+        next = state.apply(message, tls);
     }
     if let Some(failure) = state.failure() {
         return Err(StepError::new(failure.class, failure.message.clone()));
     }
     let state = Arc::new(Mutex::new(state));
     let alive = Alive::new(&instance.watches.running, &state);
-    let task = tokio::spawn(follow(stream, Arc::clone(&state), tls, alive));
+    let resume = Resume {
+        client: client.clone(),
+        key: create.key.clone(),
+        prefix: create.prefix,
+        seconds,
+        tls,
+    };
+    let stream = (next != Next::Reopen).then_some(stream);
+    let task = tokio::spawn(follow(stream, Arc::clone(&state), resume, alive));
     instance.watches.map().insert(
         create.name.clone(),
         Entry {

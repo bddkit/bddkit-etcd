@@ -162,7 +162,9 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
         | Step::WatchedPut
         | Step::WatchedDelete
         | Step::WatchedCount
-        | Step::WatchedEvents => return Err(StepError::input("not an action")),
+        | Step::WatchedEvents
+        | Step::WatchResumed
+        | Step::WatchResumedTimes => return Err(StepError::input("not an action")),
     })
 }
 
