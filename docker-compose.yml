@@ -16,6 +16,23 @@ services:
       timeout: 3s
       retries: 20
 
+  # A second plain etcd, the other server of `examples/etcd.yaml`: a key written
+  # to one is not on the other.
+  etcd-b:
+    image: quay.io/coreos/etcd:${ETCD_VERSION:-v3.6.17}
+    command:
+      - /usr/local/bin/etcd
+      - --data-dir=/tmp/etcd
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:12379
+    ports:
+      - "12379:2379"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "endpoint", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
   # TLS with a server certificate whose only name is etcd.test (the tests give
   # `tls_server_name`). The healthchecks skip verification: the certificate does
   # not name 127.0.0.1, on purpose, and a check that only waits for startup
