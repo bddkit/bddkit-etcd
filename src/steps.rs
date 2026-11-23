@@ -10,6 +10,7 @@ use crate::expect;
 use crate::node;
 use crate::ops::Request;
 use crate::reply;
+use crate::watch;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -43,10 +44,19 @@ pub enum Step {
     RefuseRead,
     RefuseReadSerializable,
     RefuseCompact,
+    WatchKey,
+    WatchPrefix,
+    WatchKeyFrom,
+    WatchPrefixFrom,
+    WatchCancel,
+    WatchedPut,
+    WatchedDelete,
+    WatchedCount,
+    WatchedEvents,
 }
 
 /// In the order the host indexes them.
-const ALL: [Step; 30] = [
+const ALL: [Step; 39] = [
     Step::Put,
     Step::PutDocString,
     Step::Get,
@@ -77,6 +87,15 @@ const ALL: [Step; 30] = [
     Step::RefuseRead,
     Step::RefuseReadSerializable,
     Step::RefuseCompact,
+    Step::WatchKey,
+    Step::WatchPrefix,
+    Step::WatchKeyFrom,
+    Step::WatchPrefixFrom,
+    Step::WatchCancel,
+    Step::WatchedPut,
+    Step::WatchedDelete,
+    Step::WatchedCount,
+    Step::WatchedEvents,
 ];
 
 struct Spec {
@@ -91,6 +110,7 @@ const NONE: &[&str] = &[];
 const REVISION: &[&str] = &["etcd_revision"];
 const DELETED: &[&str] = &["etcd_revision", "etcd_deleted"];
 const HASH: &[&str] = &["{name}"];
+const WATCH: &[&str] = &["etcd_watch_{name}_revision"];
 const READ: &[&str] = &[
     "etcd_value",
     "etcd_create_revision",
@@ -115,7 +135,12 @@ impl Step {
             | Self::DeletePrefix
             | Self::DeleteAll
             | Self::GetSerializable
-            | Self::ComputeHash => false,
+            | Self::ComputeHash
+            | Self::WatchKey
+            | Self::WatchPrefix
+            | Self::WatchKeyFrom
+            | Self::WatchPrefixFrom
+            | Self::WatchCancel => false,
             Self::Exists
             | Self::Absent
             | Self::HasValue
@@ -137,7 +162,11 @@ impl Step {
             | Self::AcceptReadSerializable
             | Self::RefuseRead
             | Self::RefuseReadSerializable
-            | Self::RefuseCompact => true,
+            | Self::RefuseCompact
+            | Self::WatchedPut
+            | Self::WatchedDelete
+            | Self::WatchedCount
+            | Self::WatchedEvents => true,
         }
     }
 
@@ -160,6 +189,22 @@ impl Step {
                 | Self::RefuseRead
                 | Self::RefuseReadSerializable
                 | Self::RefuseCompact
+        )
+    }
+
+    /// The steps about named watches, see `watch.rs`.
+    pub fn is_watch(self) -> bool {
+        matches!(
+            self,
+            Self::WatchKey
+                | Self::WatchPrefix
+                | Self::WatchKeyFrom
+                | Self::WatchPrefixFrom
+                | Self::WatchCancel
+                | Self::WatchedPut
+                | Self::WatchedDelete
+                | Self::WatchedCount
+                | Self::WatchedEvents
         )
     }
 
@@ -264,6 +309,15 @@ impl Step {
             | Self::RefuseRead
             | Self::RefuseReadSerializable
             | Self::RefuseCompact => self.expect_spec(),
+            Self::WatchKey
+            | Self::WatchPrefix
+            | Self::WatchKeyFrom
+            | Self::WatchPrefixFrom
+            | Self::WatchCancel
+            | Self::WatchedPut
+            | Self::WatchedDelete
+            | Self::WatchedCount
+            | Self::WatchedEvents => self.watch_spec(),
         };
         Spec {
             expression,
@@ -333,6 +387,58 @@ impl Step {
                 NONE,
             ),
             _ => unreachable!("not an accept / refuse step"),
+        }
+    }
+
+    /// The watch steps, kept apart so `spec` stays short.
+    fn watch_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
+        match self {
+            Self::WatchKey => (
+                r#"I watch etcd key "{key}" as "{name}""#,
+                "opens a watch on a key and returns once the server has confirmed it, so a write in the next step is in the stream; the watch keeps every event, with the previous value, until the scenario ends; stores the revision of the confirmation in etcd_watch_<name>_revision",
+                WATCH,
+            ),
+            Self::WatchPrefix => (
+                r#"I watch etcd keys with prefix "{prefix}" as "{name}""#,
+                "opens a watch on every key under a prefix; otherwise as I watch etcd key",
+                WATCH,
+            ),
+            Self::WatchKeyFrom => (
+                r#"I watch etcd key "{key}" as "{name}" from revision {rev:uint}"#,
+                "opens a watch on a key that first replays the writes from this revision on; fails when the server has compacted it; otherwise as I watch etcd key",
+                WATCH,
+            ),
+            Self::WatchPrefixFrom => (
+                r#"I watch etcd keys with prefix "{prefix}" as "{name}" from revision {rev:uint}"#,
+                "opens a watch on a prefix that first replays the writes from this revision on; fails when the server has compacted it; otherwise as I watch etcd key",
+                WATCH,
+            ),
+            Self::WatchCancel => (
+                r#"I cancel etcd watch "{name}""#,
+                "stops a watch of this instance; what it received stays readable by the assertions until the scenario ends, and its name stays taken",
+                NONE,
+            ),
+            Self::WatchedPut => (
+                r#"etcd watch "{name}" should have received a PUT of "{key}" with value "{value}""#,
+                "passes when any event of the watch's history is this PUT; reads what the watch has already collected, never the server",
+                NONE,
+            ),
+            Self::WatchedDelete => (
+                r#"etcd watch "{name}" should have received a DELETE of "{key}""#,
+                "passes when any event of the watch's history is a DELETE of this key; reads what the watch has already collected, never the server",
+                NONE,
+            ),
+            Self::WatchedCount => (
+                r#"etcd watch "{name}" should have received {n:uint} events"#,
+                "passes when the watch's history holds exactly this many events; not yet while it holds fewer, a failure once it holds more",
+                NONE,
+            ),
+            Self::WatchedEvents => (
+                r#"etcd watch "{name}" should have received events:"#,
+                "passes when the watch's whole history, in order, is the rows of a table; the header picks the columns out of type (PUT or DELETE), key, value, prev_value (empty when the key had none), mod_revision and version; not yet while the history is a beginning of the rows, a failure once it differs from them",
+                NONE,
+            ),
+            _ => unreachable!("not a watch step"),
         }
     }
 
@@ -418,6 +524,11 @@ pub fn validate(index: u32, request: &str) -> String {
         if let Err(error) = checked {
             return reply::err(error, &[]);
         }
+    } else if step.is_watch() {
+        let checked = Request::parse(&request.to_string()).and_then(|r| watch::validate(step, &r));
+        if let Err(error) = checked {
+            return reply::err(error, &[]);
+        }
     } else if step.is_assertion() {
         let checked =
             Request::parse(&request.to_string()).and_then(|parsed| check::validate(step, &parsed));
@@ -460,7 +571,7 @@ mod tests {
             let found = Step::from_index(u32::try_from(index).expect("small")).expect("step");
             assert!(found == *step);
         }
-        assert!(Step::from_index(30).is_none());
+        assert!(Step::from_index(39).is_none());
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::instance::{Instance, Last};
 use crate::node::{self, Node};
 use crate::reply;
 use crate::steps::{EMPTY_PREFIX, Step};
+use crate::watch::{self, Watch};
 
 /// What a step reads of the dispatch request.
 pub struct Request {
@@ -152,7 +153,16 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
         | Step::AcceptReadSerializable
         | Step::RefuseRead
         | Step::RefuseReadSerializable
-        | Step::RefuseCompact => return Err(StepError::input("not an action")),
+        | Step::RefuseCompact
+        | Step::WatchKey
+        | Step::WatchPrefix
+        | Step::WatchKeyFrom
+        | Step::WatchPrefixFrom
+        | Step::WatchCancel
+        | Step::WatchedPut
+        | Step::WatchedDelete
+        | Step::WatchedCount
+        | Step::WatchedEvents => return Err(StepError::input("not an action")),
     })
 }
 
@@ -163,6 +173,7 @@ enum Op {
     Check(Check),
     Node(Node),
     Expect(Expect),
+    Watch(Watch),
 }
 
 impl Op {
@@ -176,13 +187,16 @@ impl Op {
             | Self::Act(Action::Get {
                 serializable: true, ..
             }) => true,
-            Self::Act(_) | Self::Check(_) => false,
+            Self::Act(_) | Self::Check(_) | Self::Watch(_) => false,
         }
     }
 }
 
-fn plan_op(step: Step, request: &Request, endpoints: usize) -> Result<Op, StepError> {
-    if step.is_expect() {
+fn plan_op(step: Step, request: &Request, instance: &Instance) -> Result<Op, StepError> {
+    let endpoints = instance.config.endpoints.len();
+    if step.is_watch() {
+        watch::plan(step, request).map(Op::Watch)
+    } else if step.is_expect() {
         expect::plan(step, request).map(Op::Expect)
     } else if step.is_node() {
         node::plan(step, request, endpoints).map(Op::Node)
@@ -199,6 +213,7 @@ fn record_for(op: &Op, instance: &str) -> Record {
         Op::Act(action) => record_for_action(action, instance),
         Op::Node(node) => node::record_for(node, instance),
         Op::Expect(expect) => expect::record_for(expect, instance),
+        Op::Watch(watch) => watch::record_for(watch, instance),
     }
 }
 
@@ -336,11 +351,23 @@ async fn perform(
             .map(|()| Vars::new()),
         Op::Node(node) => node::perform(client, tls, node, record).await,
         Op::Expect(expect) => expect::perform(client, tls, expect, record).await,
+        Op::Watch(_) => Err(StepError::input(
+            "a watch step never runs on a client of its own",
+        )),
     }
 }
 
+/// Neither phase names itself: without a password the client connects
+/// lazily, so a client that exists proves nothing about the server.
+pub fn no_response(seconds: u64) -> StepError {
+    StepError::new(
+        Class::DbConnection,
+        format!("no response within {seconds} s"),
+    )
+}
+
 pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
-    let op = match plan_op(step, request, instance.config.endpoints.len()) {
+    let op = match plan_op(step, request, instance) {
         Ok(op) => op,
         Err(error) => return reply::failed(&error, &[], &[], &[]),
     };
@@ -350,14 +377,13 @@ pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
     // Each phase has `timeout_secs` of its own. Neither names the phase it
     // was in: without a password the client connects lazily, so a client that
     // exists proves nothing about the server.
-    let no_response = || {
-        StepError::new(
-            Class::DbConnection,
-            format!("no response within {seconds} s"),
-        )
-    };
+    let no_response = || no_response(seconds);
     let started = Instant::now();
     let result = async {
+        // A watch step reads its own state first, and opens its own stream.
+        if let Op::Watch(op) = &op {
+            return watch::perform(instance, op, &mut record).await;
+        }
         let client = tokio::time::timeout(limit, instance.client(!op.local()))
             .await
             .map_err(|_| no_response())??;
@@ -369,7 +395,9 @@ pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
     .await;
     // An assertion is asked again by the host; an action never answers
     // `not_yet`.
-    let result = if step.is_assertion() {
+    // A watch assertion reads the buffer and never the server: what it finds
+    // wrong with the watch is not a failure to try again.
+    let result = if step.is_assertion() && !step.is_watch() {
         result.map_err(StepError::polled)
     } else {
         result
