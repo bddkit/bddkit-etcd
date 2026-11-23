@@ -36,7 +36,7 @@ fn hash_revision(text: &str) -> Result<i64, StepError> {
     }
 }
 
-fn revision(text: &str) -> Result<i64, StepError> {
+pub(crate) fn revision(text: &str) -> Result<i64, StepError> {
     text.parse::<u64>()
         .ok()
         .and_then(|rev| i64::try_from(rev).ok())
@@ -99,7 +99,14 @@ pub fn plan(step: Step, request: &Request, endpoints: usize) -> Result<Node, Ste
         | Step::HasFields
         | Step::Count
         | Step::KeysBe
-        | Step::KeysContain => return Err(StepError::input("not a node step")),
+        | Step::KeysContain
+        | Step::AcceptPut
+        | Step::RefusePut
+        | Step::AcceptRead
+        | Step::AcceptReadSerializable
+        | Step::RefuseRead
+        | Step::RefuseReadSerializable
+        | Step::RefuseCompact => return Err(StepError::input("not a node step")),
     })
 }
 

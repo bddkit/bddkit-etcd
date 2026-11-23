@@ -201,22 +201,7 @@ fn a_serializable_read_answers_on_a_node_that_lost_its_quorum_and_a_linearizable
     }
     cluster.kill(1);
     cluster.kill(2);
-    // The survivor steps down once it notices: until then a read would wait.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let reply = handles[0].run(LEADER, &[]);
-        if reply["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("no leader"))
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "still a leader after 30 s: {reply}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    common::wait_without_leader(&handles[0]);
     let local = handles[0].run(GET_SERIALIZABLE, &["/bddkit-etcd/cluster/quorum"]);
     assert!(passed(&local), "{local}");
     assert_eq!(local["vars"]["etcd_value"], "kept");
