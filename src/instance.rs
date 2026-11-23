@@ -10,6 +10,7 @@ use tokio::sync::OnceCell;
 use crate::client;
 use crate::config::Config;
 use crate::error::StepError;
+use crate::watch::Watches;
 
 /// The last operation as the failure dump shows it.
 #[derive(Clone, Default)]
@@ -27,6 +28,8 @@ pub struct Instance {
     /// leader must still answer.
     local: OnceCell<Client>,
     last: Mutex<Option<Last>>,
+    /// The named watches of the scenario.
+    pub watches: Watches,
 }
 
 impl Instance {
@@ -36,6 +39,7 @@ impl Instance {
             client: OnceCell::new(),
             local: OnceCell::new(),
             last: Mutex::new(None),
+            watches: Watches::default(),
         }
     }
 
@@ -68,9 +72,10 @@ impl Instance {
         self.last_slot().clone()
     }
 
-    /// The scenario boundary: forgets the last operation and touches no
-    /// connection. The client stays, it is not scenario state.
-    pub fn forget(&self) {
+    /// The scenario boundary: forgets the last operation, ends every watch,
+    /// and touches no connection. The client stays, it is not scenario state.
+    pub async fn reset(&self) {
         *self.last_slot() = None;
+        self.watches.stop_all().await;
     }
 }

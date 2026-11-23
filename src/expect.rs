@@ -146,7 +146,16 @@ pub fn plan(step: Step, request: &Request) -> Result<Expect, StepError> {
         | Step::NotLeader
         | Step::Reached
         | Step::ComputeHash
-        | Step::HashIs => return Err(StepError::input("not an accept / refuse step")),
+        | Step::HashIs
+        | Step::WatchKey
+        | Step::WatchPrefix
+        | Step::WatchKeyFrom
+        | Step::WatchPrefixFrom
+        | Step::WatchCancel
+        | Step::WatchedPut
+        | Step::WatchedDelete
+        | Step::WatchedCount
+        | Step::WatchedEvents => return Err(StepError::input("not an accept / refuse step")),
     };
     Ok(Expect { call, wanted })
 }

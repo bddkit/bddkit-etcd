@@ -140,7 +140,7 @@ fn number(cell: &str) -> Result<i64, String> {
 /// Where each wanted column sits in the header row, the first `required` of
 /// them being mandatory. A header the step does not know and a repeated one
 /// are refused.
-fn columns(
+pub(crate) fn columns(
     table: Option<&[Vec<String>]>,
     wanted: &[&str],
     required: usize,
@@ -264,7 +264,16 @@ pub fn plan(step: Step, request: &Request) -> Result<Check, StepError> {
         | Step::AcceptReadSerializable
         | Step::RefuseRead
         | Step::RefuseReadSerializable
-        | Step::RefuseCompact => Err(StepError::input("not an assertion")),
+        | Step::RefuseCompact
+        | Step::WatchKey
+        | Step::WatchPrefix
+        | Step::WatchKeyFrom
+        | Step::WatchPrefixFrom
+        | Step::WatchCancel
+        | Step::WatchedPut
+        | Step::WatchedDelete
+        | Step::WatchedCount
+        | Step::WatchedEvents => Err(StepError::input("not an assertion")),
     }
 }
 
@@ -342,11 +351,11 @@ pub fn record_for(check: &Check, instance: &str) -> Record {
     Record::new("Get", &target, instance, request)
 }
 
-fn miss(message: String) -> StepError {
+pub(crate) fn miss(message: String) -> StepError {
     StepError::not_yet(Class::Assertion, message)
 }
 
-fn lossy(bytes: &[u8]) -> String {
+pub(crate) fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 

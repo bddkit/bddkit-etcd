@@ -298,3 +298,49 @@ fn a_literal_mistake_in_an_assertion_stops_the_run_before_the_first_request() {
     assert_eq!(code, Some(2), "{text}");
     assert!(text.contains("unknown field \"colour\""), "{text}");
 }
+
+#[test]
+fn a_watch_scenario_runs_through_the_host_and_a_failure_dump_shows_the_watch() {
+    let bin = require_bddkit!();
+    let cfg = keys_project(
+        "watch",
+        r#"    Given I watch etcd keys with prefix "<<prefix>>" as "cfg"
+    And I watch etcd key "<<prefix>>a" as "late" from revision <<etcd_watch_cfg_revision>>
+    When I put etcd key "<<prefix>>a" with value "1"
+    And I put etcd key "<<prefix>>a" with value "2"
+    Then I expect the next assertion to pass within 10 seconds, checking every 100 milliseconds
+    And etcd watch "cfg" should have received events:
+      | type | key         | value | prev_value |
+      | PUT  | <<prefix>>a | 1     |            |
+      | PUT  | <<prefix>>a | 2     | 1          |
+    And I expect the next assertion to pass within 10 seconds, checking every 100 milliseconds
+    And etcd watch "late" should have received 2 events
+    And I cancel etcd watch "cfg"
+    And I delete etcd keys with prefix "<<prefix>>"
+    And variable "etcd_watch_cfg_revision" should be equal to "0"
+"#,
+    );
+    let (code, text, _) = run_with_report(&bin, &cfg);
+    wipe(&format!("/bddkit-etcd/e2e/watch/{}/", std::process::id()));
+    // The last step belongs to the host, and the dump says what each watch holds.
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("etcd watch cfg (json)"), "{text}");
+    assert!(text.contains("\"state\": \"cancelled\""), "{text}");
+    assert!(text.contains("\"state\": \"running\""), "{text}");
+}
+
+#[test]
+fn a_literal_mistake_in_a_watch_table_stops_the_run_before_the_first_request() {
+    let bin = require_bddkit!();
+    let cfg = keys_project(
+        "watchmistake",
+        r#"    Given I watch etcd keys with prefix "<<prefix>>" as "cfg"
+    Then etcd watch "cfg" should have received events:
+      | type | revision |
+      | PUT  | 1        |
+"#,
+    );
+    let (code, text, _) = run_with_report(&bin, &cfg);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("unknown table column \"revision\""), "{text}");
+}

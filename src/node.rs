@@ -44,7 +44,7 @@ pub(crate) fn revision(text: &str) -> Result<i64, StepError> {
 }
 
 /// The name of a variable: what `<<name>>` can read back.
-fn variable(text: &str) -> Result<String, StepError> {
+pub(crate) fn variable(text: &str) -> Result<String, StepError> {
     if !text.is_empty() && text.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return Ok(text.to_string());
     }
@@ -106,7 +106,16 @@ pub fn plan(step: Step, request: &Request, endpoints: usize) -> Result<Node, Ste
         | Step::AcceptReadSerializable
         | Step::RefuseRead
         | Step::RefuseReadSerializable
-        | Step::RefuseCompact => return Err(StepError::input("not a node step")),
+        | Step::RefuseCompact
+        | Step::WatchKey
+        | Step::WatchPrefix
+        | Step::WatchKeyFrom
+        | Step::WatchPrefixFrom
+        | Step::WatchCancel
+        | Step::WatchedPut
+        | Step::WatchedDelete
+        | Step::WatchedCount
+        | Step::WatchedEvents => return Err(StepError::input("not a node step")),
     })
 }
 

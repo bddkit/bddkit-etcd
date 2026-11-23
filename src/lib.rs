@@ -14,11 +14,12 @@ mod ops;
 mod reply;
 mod runtime;
 mod steps;
+mod watch;
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use config::Config;
@@ -219,30 +220,60 @@ pub extern "C" fn bddkit_dispatch(
 /// The scenario boundary. Opens no connection.
 #[unsafe(no_mangle)]
 pub extern "C" fn bddkit_reset_scenario(handle: u64) -> *mut c_char {
-    guard("envelope", move || match instances().get(&handle) {
-        Some(instance) => {
-            instance.forget();
-            reply::ok()
+    guard("envelope", move || {
+        let instance = instances().get(&handle).map(Arc::clone);
+        let Some(instance) = instance else {
+            return reply::err("unknown handle", &[]);
+        };
+        // Every watch task is stopped, so none outlives the scenario.
+        match runtime::block_on(async {
+            instance.reset().await;
+            Ok(())
+        }) {
+            Ok(()) => reply::ok(),
+            Err(error) => reply::err(error, &[]),
         }
-        None => reply::err("unknown handle", &[]),
     })
+}
+
+/// How many watch tasks of the handle are alive. For the tests: the counter
+/// outlives the handle, so a test can read it after the drop.
+#[doc(hidden)]
+pub fn watch_tasks(handle: u64) -> Option<Arc<AtomicUsize>> {
+    instances().get(&handle).map(|i| i.watches.running())
 }
 
 /// The last operation of the scenario, for the dump of any failing step.
 #[unsafe(no_mangle)]
 pub extern "C" fn bddkit_failure_context(handle: u64) -> *mut c_char {
     guard("envelope", move || {
-        let last = instances().get(&handle).and_then(|i| i.last());
-        let last = last.unwrap_or_default();
-        reply::failure_context(&last.diagnostics, &last.scan)
+        let instance = instances().get(&handle).map(Arc::clone);
+        let last = instance.as_ref().and_then(|i| i.last()).unwrap_or_default();
+        let (mut diagnostics, mut scan) = (last.diagnostics, last.scan);
+        if let Some(instance) = &instance {
+            let (watches, values) = instance.watches.context();
+            diagnostics.extend(watches);
+            scan.extend(values);
+        }
+        reply::failure_context(&diagnostics, &scan)
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn bddkit_drop_instance(handle: u64) -> *mut c_char {
-    guard("envelope", move || match instances().remove(&handle) {
-        Some(_) => reply::ok(),
-        None => reply::err("unknown handle", &[]),
+    guard("envelope", move || {
+        let removed = instances().remove(&handle);
+        let Some(instance) = removed else {
+            return reply::err("unknown handle", &[]);
+        };
+        // It waits until the watch tasks have stopped.
+        match runtime::block_on(async {
+            instance.watches.stop_all().await;
+            Ok(())
+        }) {
+            Ok(()) => reply::ok(),
+            Err(error) => reply::err(error, &[]),
+        }
     })
 }
 
