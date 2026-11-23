@@ -8,6 +8,7 @@ pub mod config;
 mod error;
 mod evidence;
 mod instance;
+mod node;
 mod ops;
 mod reply;
 mod runtime;

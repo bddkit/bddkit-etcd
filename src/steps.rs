@@ -6,6 +6,7 @@
 use serde_json::{Value, json};
 
 use crate::check;
+use crate::node;
 use crate::ops::Request;
 use crate::reply;
 
@@ -28,10 +29,16 @@ pub enum Step {
     Count,
     KeysBe,
     KeysContain,
+    GetSerializable,
+    Leader,
+    NotLeader,
+    Reached,
+    ComputeHash,
+    HashIs,
 }
 
 /// In the order the host indexes them.
-const ALL: [Step; 17] = [
+const ALL: [Step; 23] = [
     Step::Put,
     Step::PutDocString,
     Step::Get,
@@ -49,6 +56,12 @@ const ALL: [Step; 17] = [
     Step::Count,
     Step::KeysBe,
     Step::KeysContain,
+    Step::GetSerializable,
+    Step::Leader,
+    Step::NotLeader,
+    Step::Reached,
+    Step::ComputeHash,
+    Step::HashIs,
 ];
 
 struct Spec {
@@ -62,6 +75,7 @@ struct Spec {
 const NONE: &[&str] = &[];
 const REVISION: &[&str] = &["etcd_revision"];
 const DELETED: &[&str] = &["etcd_revision", "etcd_deleted"];
+const HASH: &[&str] = &["{name}"];
 const READ: &[&str] = &[
     "etcd_value",
     "etcd_create_revision",
@@ -84,7 +98,9 @@ impl Step {
             | Self::Get
             | Self::DeleteKey
             | Self::DeletePrefix
-            | Self::DeleteAll => false,
+            | Self::DeleteAll
+            | Self::GetSerializable
+            | Self::ComputeHash => false,
             Self::Exists
             | Self::Absent
             | Self::HasValue
@@ -95,8 +111,20 @@ impl Step {
             | Self::HasFields
             | Self::Count
             | Self::KeysBe
-            | Self::KeysContain => true,
+            | Self::KeysContain
+            | Self::Leader
+            | Self::NotLeader
+            | Self::Reached
+            | Self::HashIs => true,
         }
+    }
+
+    /// The steps about one node of a cluster, see `node.rs`.
+    pub fn is_node(self) -> bool {
+        matches!(
+            self,
+            Self::Leader | Self::NotLeader | Self::Reached | Self::ComputeHash | Self::HashIs
+        )
     }
 
     /// The assertions whose first argument is the one key they read.
@@ -201,11 +229,54 @@ impl Step {
                 "passes when every key of a key / value table is under the prefix",
                 NONE,
             ),
+            Self::GetSerializable
+            | Self::Leader
+            | Self::NotLeader
+            | Self::Reached
+            | Self::ComputeHash
+            | Self::HashIs => self.cluster_spec(),
         };
         Spec {
             expression,
             description,
             sets_vars,
+        }
+    }
+
+    /// The steps of the cluster, kept apart so `spec` stays short.
+    fn cluster_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
+        match self {
+            Self::GetSerializable => (
+                r#"I get etcd key "{key}" serializable"#,
+                "reads a key from the node that answers, without asking the leader (it may be stale); same variables and failures as I get etcd key",
+                READ,
+            ),
+            Self::Leader => (
+                "etcd node should be the leader",
+                "passes when the node of the instance, which must have exactly one endpoint, leads the cluster",
+                NONE,
+            ),
+            Self::NotLeader => (
+                "etcd node should not be the leader",
+                "passes when the node of the instance, which must have exactly one endpoint, does not lead the cluster",
+                NONE,
+            ),
+            Self::Reached => (
+                "etcd node should have reached revision {rev:uint}",
+                "passes once the revision of the node, which must have exactly one endpoint, is at least this",
+                NONE,
+            ),
+            Self::ComputeHash => (
+                r#"I compute etcd hash at revision {rev:uint} as "{name}""#,
+                "stores the HashKV hash of the node, which must have exactly one endpoint, at the revision in the variable; a compaction changes the hash of an older revision",
+                HASH,
+            ),
+            Self::HashIs => (
+                r#"etcd hash at revision {rev:uint} should be "{hash}""#,
+                "passes when the HashKV hash of the node at the revision is this decimal number; not yet while the node has not reached the revision, a different hash is final (assuming no compaction between the two hashes)",
+                NONE,
+            ),
+            _ => unreachable!("not a cluster step"),
         }
     }
 }
@@ -244,7 +315,12 @@ pub fn validate(index: u32, request: &str) -> String {
     if step == Step::DeletePrefix && request["args"][0] == "" {
         return reply::err(EMPTY_PREFIX, &[]);
     }
-    if step.is_assertion() {
+    if step.is_node() {
+        let checked = Request::parse(&request.to_string()).and_then(|r| node::validate(step, &r));
+        if let Err(error) = checked {
+            return reply::err(error, &[]);
+        }
+    } else if step.is_assertion() {
         let checked =
             Request::parse(&request.to_string()).and_then(|parsed| check::validate(step, &parsed));
         if let Err(error) = checked {
@@ -273,7 +349,9 @@ mod tests {
             assert_eq!(step["kind"], kind, "{expression}");
             assert!(step["expression"].as_str().expect("text").contains("etcd"));
             for var in step["sets_vars"].as_array().expect("list") {
-                assert!(var.as_str().expect("text").starts_with("etcd_"), "{var}");
+                let var = var.as_str().expect("text");
+                // A variable the tester names is the value of a parameter.
+                assert!(var.starts_with("etcd_") || var == "{name}", "{var}");
             }
         }
     }
@@ -284,7 +362,7 @@ mod tests {
             let found = Step::from_index(u32::try_from(index).expect("small")).expect("step");
             assert!(found == *step);
         }
-        assert!(Step::from_index(17).is_none());
+        assert!(Step::from_index(23).is_none());
     }
 
     #[test]

@@ -85,6 +85,22 @@ jobs:
           cargo install --git https://github.com/bddkit/bddkit --tag "$HOST_TAG"
           --locked --root "$RUNNER_TEMP/bddkit-host" bddkit
 
+      # The cluster tests start three real etcd processes of the matrix's
+      # version, so they need the binary and not an image.
+      - name: Cache the etcd binary
+        id: etcd-bin
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/etcd-bin
+          key: etcd-bin-${{ matrix.etcd }}-${{ runner.os }}
+      - name: Download etcd
+        if: steps.etcd-bin.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/etcd-bin"
+          name="etcd-${{ matrix.etcd }}-linux-amd64"
+          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${{ matrix.etcd }}/$name.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP/etcd-bin" --strip-components=1 "$name/etcd"
+
       # --wait returns once the healthcheck passes.
       - name: Start etcd
         env:
@@ -96,4 +112,5 @@ jobs:
           export BDDKIT_BIN="$RUNNER_TEMP/bddkit-host/bin/bddkit"
           # The server is the job's own: a test may clear all of it.
           export BDDKIT_TEST_ETCD_WIPE=1
+          export BDDKIT_TEST_ETCD_BIN="$RUNNER_TEMP/etcd-bin/etcd"
           cargo test --locked

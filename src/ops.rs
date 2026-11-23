@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use etcd_client::{Client, DeleteOptions, ResponseHeader};
+use etcd_client::{Client, DeleteOptions, GetOptions, ResponseHeader};
 use serde_json::{Value, json};
 
 use crate::check::{self, Check};
@@ -13,6 +13,7 @@ use crate::client::request_failure;
 use crate::error::{Class, StepError};
 use crate::evidence::{Record, base64, shown};
 use crate::instance::{Instance, Last};
+use crate::node::{self, Node};
 use crate::reply;
 use crate::steps::{EMPTY_PREFIX, Step};
 
@@ -52,6 +53,21 @@ impl Request {
         })
     }
 
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    #[cfg(test)]
+    pub fn for_test(args: &[&str]) -> Self {
+        Self {
+            args: args.iter().map(ToString::to_string).collect(),
+            docstring: None,
+            table: None,
+            debug: false,
+            instance: "main".to_string(),
+        }
+    }
+
     pub fn arg(&self, index: usize) -> Result<&str, StepError> {
         self.args
             .get(index)
@@ -77,7 +93,7 @@ enum Range {
 #[derive(Debug)]
 enum Action {
     Put { key: String, value: String },
-    Get { key: String },
+    Get { key: String, serializable: bool },
     Delete(Range),
 }
 
@@ -101,7 +117,10 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
             key: key()?,
             value: doc_value(request.doc()?).to_string(),
         },
-        Step::Get => Action::Get { key: key()? },
+        Step::Get | Step::GetSerializable => Action::Get {
+            key: key()?,
+            serializable: step == Step::GetSerializable,
+        },
         Step::DeleteKey => Action::Delete(Range::Key(key()?)),
         // An empty value that came through a variable: a literal one never
         // gets here, `validate` stops it.
@@ -120,7 +139,12 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
         | Step::HasFields
         | Step::Count
         | Step::KeysBe
-        | Step::KeysContain => return Err(StepError::input("not an action")),
+        | Step::KeysContain
+        | Step::Leader
+        | Step::NotLeader
+        | Step::Reached
+        | Step::ComputeHash
+        | Step::HashIs => return Err(StepError::input("not an action")),
     })
 }
 
@@ -129,10 +153,29 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
 enum Op {
     Act(Action),
     Check(Check),
+    Node(Node),
 }
 
-fn plan_op(step: Step, request: &Request) -> Result<Op, StepError> {
-    if step.is_assertion() {
+impl Op {
+    /// Whether the step runs on the client that does not ask for a leader:
+    /// a serializable read and every node step must answer on a node that
+    /// has none.
+    fn local(&self) -> bool {
+        matches!(
+            self,
+            Self::Node(_)
+                | Self::Act(Action::Get {
+                    serializable: true,
+                    ..
+                })
+        )
+    }
+}
+
+fn plan_op(step: Step, request: &Request, endpoints: usize) -> Result<Op, StepError> {
+    if step.is_node() {
+        node::plan(step, request, endpoints).map(Op::Node)
+    } else if step.is_assertion() {
         check::plan(step, request).map(Op::Check)
     } else {
         plan(step, request).map(Op::Act)
@@ -143,6 +186,7 @@ fn record_for(op: &Op, instance: &str) -> Record {
     match op {
         Op::Check(check) => check::record_for(check, instance),
         Op::Act(action) => record_for_action(action, instance),
+        Op::Node(node) => node::record_for(node, instance),
     }
 }
 
@@ -153,7 +197,12 @@ fn record_for_action(action: &Action, instance: &str) -> Record {
             record.scan_text(value);
             record
         }
-        Action::Get { key } => Record::new("Get", key, instance, json!({"key": key})),
+        Action::Get { key, serializable } => Record::new(
+            "Get",
+            key,
+            instance,
+            json!({"key": key, "serializable": serializable}),
+        ),
         Action::Delete(Range::Key(key)) => {
             Record::new("Delete", key, instance, json!({"key": key}))
         }
@@ -169,12 +218,12 @@ fn record_for_action(action: &Action, instance: &str) -> Record {
     }
 }
 
-type Vars = BTreeMap<String, String>;
+pub type Vars = BTreeMap<String, String>;
 
 /// The header of an answer. A server that sends none gives no revision, and
 /// the host keeps a variable a reply does not name, so a step that went on
 /// would leave the previous step's `etcd_revision` to be read as this one's.
-fn header(header: Option<&ResponseHeader>) -> Result<&ResponseHeader, StepError> {
+pub fn header(header: Option<&ResponseHeader>) -> Result<&ResponseHeader, StepError> {
     header.ok_or_else(|| {
         StepError::new(
             Class::DbStatement,
@@ -203,9 +252,10 @@ async fn perform_action(
             record.answered(response.header());
             Ok(revision_vars(header(response.header())?))
         }
-        Action::Get { key } => {
+        Action::Get { key, serializable } => {
+            let options = serializable.then(|| GetOptions::new().with_serializable());
             let response = kv
-                .get(key.as_str(), None)
+                .get(key.as_str(), options)
                 .await
                 .map_err(|e| request_failure(&e, tls))?;
             record.answered(response.header());
@@ -272,11 +322,12 @@ async fn perform(
         Op::Check(check) => check::perform(client, tls, check, record)
             .await
             .map(|()| Vars::new()),
+        Op::Node(node) => node::perform(client, tls, node, record).await,
     }
 }
 
 pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
-    let op = match plan_op(step, request) {
+    let op = match plan_op(step, request, instance.config.endpoints.len()) {
         Ok(op) => op,
         Err(error) => return reply::failed(&error, &[], &[], &[]),
     };
@@ -294,7 +345,7 @@ pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
     };
     let started = Instant::now();
     let result = async {
-        let client = tokio::time::timeout(limit, instance.client())
+        let client = tokio::time::timeout(limit, instance.client(!op.local()))
             .await
             .map_err(|_| no_response())??;
         let tls = instance.config.tls;
@@ -305,9 +356,10 @@ pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
     .await;
     // An assertion is asked again by the host; an action never answers
     // `not_yet`.
-    let result = match op {
-        Op::Check(_) => result.map_err(StepError::polled),
-        Op::Act(_) => result,
+    let result = if step.is_assertion() {
+        result.map_err(StepError::polled)
+    } else {
+        result
     };
     record.took(started.elapsed());
     let diagnostics = vec![record.diagnostic()];

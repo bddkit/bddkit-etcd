@@ -23,6 +23,9 @@ pub struct Instance {
     /// Built at the first dispatch, never at init. A failed connect is not
     /// kept: the next step tries again.
     client: OnceCell<Client>,
+    /// The same, without `require_leader`: for what a node that lost its
+    /// leader must still answer.
+    local: OnceCell<Client>,
     last: Mutex<Option<Last>>,
 }
 
@@ -31,19 +34,25 @@ impl Instance {
         Self {
             config,
             client: OnceCell::new(),
+            local: OnceCell::new(),
             last: Mutex::new(None),
         }
     }
 
-    pub async fn client(&self) -> Result<&Client, StepError> {
-        self.client
-            .get_or_try_init(|| async {
-                let options = client::step_options(&self.config).map_err(StepError::input)?;
-                Client::connect(&self.config.endpoints, Some(options))
-                    .await
-                    .map_err(|e| client::connect_failure(&e, self.config.tls))
-            })
-            .await
+    pub async fn client(&self, require_leader: bool) -> Result<&Client, StepError> {
+        let cell = if require_leader {
+            &self.client
+        } else {
+            &self.local
+        };
+        cell.get_or_try_init(|| async {
+            let options =
+                client::step_options(&self.config, require_leader).map_err(StepError::input)?;
+            Client::connect(&self.config.endpoints, Some(options))
+                .await
+                .map_err(|e| client::connect_failure(&e, self.config.tls))
+        })
+        .await
     }
 
     /// Nothing can panic under this lock (an assignment, a clone).
