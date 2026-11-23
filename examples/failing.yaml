@@ -1,0 +1,22 @@
+# Scenarios that fail on purpose, to show what a failure looks like: the class,
+# the error text and the masking. `tests/examples.rs` runs this suite and checks
+# what it prints; it is never meant to be green.
+#   bddkit run --config examples/failing.yaml
+paths: [examples/failing-features]
+
+default_etcd: main
+
+resources:
+  etcd:
+    main:
+      endpoints: http://127.0.0.1:2379
+    # Nothing listens here.
+    down:
+      endpoints: http://127.0.0.1:1
+      timeout_secs: 1
+    # A password against a server that has authentication switched off: the
+    # server refuses it, and no output may show it.
+    guarded:
+      endpoints: http://127.0.0.1:2379
+      username: root
+      password: example-password-7f3a

@@ -89,7 +89,7 @@ jobs:
       - name: Start etcd
         env:
           ETCD_VERSION: ${{ matrix.etcd }}
-        run: docker compose up --wait etcd etcd-secure etcd-mtls etcd-auth
+        run: docker compose up --wait etcd etcd-b etcd-secure etcd-mtls etcd-auth
 
       - name: Tests
         run: |

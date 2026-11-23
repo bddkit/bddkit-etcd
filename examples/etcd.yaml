@@ -1,0 +1,14 @@
+# Two plain etcd servers: `docker compose up --wait etcd etcd-b` starts both.
+# Run from the repository root with a bddkit that loads this plugin:
+#   bddkit run --config examples/etcd.yaml
+#   bddkit run --config examples/etcd.yaml --default etcd=second
+paths: [examples/features]
+
+default_etcd: main
+
+resources:
+  etcd:
+    main:
+      endpoints: http://127.0.0.1:2379
+    second:
+      endpoints: http://127.0.0.1:12379
