@@ -334,3 +334,24 @@ pub fn sample_token() -> String {
             .to_string()
     })
 }
+
+/// Waits until the node says the cluster has no leader: the survivor of a lost
+/// quorum steps down once it notices, and until then a request would wait.
+pub fn wait_without_leader(node: &Handle) {
+    const LEADER: u32 = 18;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let reply = node.run(LEADER, &[]);
+        if reply["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("no leader"))
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still a leader after 30 s: {reply}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}

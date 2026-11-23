@@ -7,6 +7,7 @@ mod client;
 pub mod config;
 mod error;
 mod evidence;
+mod expect;
 mod instance;
 mod node;
 mod ops;

@@ -257,7 +257,14 @@ pub fn plan(step: Step, request: &Request) -> Result<Check, StepError> {
         | Step::Leader
         | Step::NotLeader
         | Step::Reached
-        | Step::HashIs => Err(StepError::input("not an assertion")),
+        | Step::HashIs
+        | Step::AcceptPut
+        | Step::RefusePut
+        | Step::AcceptRead
+        | Step::AcceptReadSerializable
+        | Step::RefuseRead
+        | Step::RefuseReadSerializable
+        | Step::RefuseCompact => Err(StepError::input("not an assertion")),
     }
 }
 

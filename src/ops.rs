@@ -12,6 +12,7 @@ use crate::check::{self, Check};
 use crate::client::request_failure;
 use crate::error::{Class, StepError};
 use crate::evidence::{Record, base64, shown};
+use crate::expect::{self, Expect};
 use crate::instance::{Instance, Last};
 use crate::node::{self, Node};
 use crate::reply;
@@ -144,7 +145,14 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
         | Step::NotLeader
         | Step::Reached
         | Step::ComputeHash
-        | Step::HashIs => return Err(StepError::input("not an action")),
+        | Step::HashIs
+        | Step::AcceptPut
+        | Step::RefusePut
+        | Step::AcceptRead
+        | Step::AcceptReadSerializable
+        | Step::RefuseRead
+        | Step::RefuseReadSerializable
+        | Step::RefuseCompact => return Err(StepError::input("not an action")),
     })
 }
 
@@ -154,6 +162,7 @@ enum Op {
     Act(Action),
     Check(Check),
     Node(Node),
+    Expect(Expect),
 }
 
 impl Op {
@@ -161,19 +170,21 @@ impl Op {
     /// a serializable read and every node step must answer on a node that
     /// has none.
     fn local(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            Self::Expect(expect) => expect.local(),
             Self::Node(_)
-                | Self::Act(Action::Get {
-                    serializable: true,
-                    ..
-                })
-        )
+            | Self::Act(Action::Get {
+                serializable: true, ..
+            }) => true,
+            Self::Act(_) | Self::Check(_) => false,
+        }
     }
 }
 
 fn plan_op(step: Step, request: &Request, endpoints: usize) -> Result<Op, StepError> {
-    if step.is_node() {
+    if step.is_expect() {
+        expect::plan(step, request).map(Op::Expect)
+    } else if step.is_node() {
         node::plan(step, request, endpoints).map(Op::Node)
     } else if step.is_assertion() {
         check::plan(step, request).map(Op::Check)
@@ -187,6 +198,7 @@ fn record_for(op: &Op, instance: &str) -> Record {
         Op::Check(check) => check::record_for(check, instance),
         Op::Act(action) => record_for_action(action, instance),
         Op::Node(node) => node::record_for(node, instance),
+        Op::Expect(expect) => expect::record_for(expect, instance),
     }
 }
 
@@ -323,6 +335,7 @@ async fn perform(
             .await
             .map(|()| Vars::new()),
         Op::Node(node) => node::perform(client, tls, node, record).await,
+        Op::Expect(expect) => expect::perform(client, tls, expect, record).await,
     }
 }
 

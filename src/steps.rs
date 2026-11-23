@@ -6,6 +6,7 @@
 use serde_json::{Value, json};
 
 use crate::check;
+use crate::expect;
 use crate::node;
 use crate::ops::Request;
 use crate::reply;
@@ -35,10 +36,17 @@ pub enum Step {
     Reached,
     ComputeHash,
     HashIs,
+    AcceptPut,
+    RefusePut,
+    AcceptRead,
+    AcceptReadSerializable,
+    RefuseRead,
+    RefuseReadSerializable,
+    RefuseCompact,
 }
 
 /// In the order the host indexes them.
-const ALL: [Step; 23] = [
+const ALL: [Step; 30] = [
     Step::Put,
     Step::PutDocString,
     Step::Get,
@@ -62,6 +70,13 @@ const ALL: [Step; 23] = [
     Step::Reached,
     Step::ComputeHash,
     Step::HashIs,
+    Step::AcceptPut,
+    Step::RefusePut,
+    Step::AcceptRead,
+    Step::AcceptReadSerializable,
+    Step::RefuseRead,
+    Step::RefuseReadSerializable,
+    Step::RefuseCompact,
 ];
 
 struct Spec {
@@ -115,7 +130,14 @@ impl Step {
             | Self::Leader
             | Self::NotLeader
             | Self::Reached
-            | Self::HashIs => true,
+            | Self::HashIs
+            | Self::AcceptPut
+            | Self::RefusePut
+            | Self::AcceptRead
+            | Self::AcceptReadSerializable
+            | Self::RefuseRead
+            | Self::RefuseReadSerializable
+            | Self::RefuseCompact => true,
         }
     }
 
@@ -124,6 +146,20 @@ impl Step {
         matches!(
             self,
             Self::Leader | Self::NotLeader | Self::Reached | Self::ComputeHash | Self::HashIs
+        )
+    }
+
+    /// The steps that expect the server to accept or refuse, see `expect.rs`.
+    pub fn is_expect(self) -> bool {
+        matches!(
+            self,
+            Self::AcceptPut
+                | Self::RefusePut
+                | Self::AcceptRead
+                | Self::AcceptReadSerializable
+                | Self::RefuseRead
+                | Self::RefuseReadSerializable
+                | Self::RefuseCompact
         )
     }
 
@@ -214,6 +250,31 @@ impl Step {
                 "passes when the key has the version, create_revision, mod_revision and lease of a field / value table",
                 NONE,
             ),
+            Self::Count | Self::KeysBe | Self::KeysContain => self.range_spec(),
+            Self::GetSerializable
+            | Self::Leader
+            | Self::NotLeader
+            | Self::Reached
+            | Self::ComputeHash
+            | Self::HashIs => self.cluster_spec(),
+            Self::AcceptPut
+            | Self::RefusePut
+            | Self::AcceptRead
+            | Self::AcceptReadSerializable
+            | Self::RefuseRead
+            | Self::RefuseReadSerializable
+            | Self::RefuseCompact => self.expect_spec(),
+        };
+        Spec {
+            expression,
+            description,
+            sets_vars,
+        }
+    }
+
+    /// The assertions over a prefix, kept apart so `spec` stays short.
+    fn range_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
+        match self {
             Self::Count => (
                 r#"there should be {n:uint} etcd keys with prefix "{prefix}""#,
                 "passes when the server counts this many keys under the prefix",
@@ -229,17 +290,49 @@ impl Step {
                 "passes when every key of a key / value table is under the prefix",
                 NONE,
             ),
-            Self::GetSerializable
-            | Self::Leader
-            | Self::NotLeader
-            | Self::Reached
-            | Self::ComputeHash
-            | Self::HashIs => self.cluster_spec(),
-        };
-        Spec {
-            expression,
-            description,
-            sets_vars,
+            _ => unreachable!("not a prefix assertion"),
+        }
+    }
+
+    /// The accept / refuse steps, kept apart so `spec` stays short.
+    fn expect_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
+        match self {
+            Self::AcceptPut => (
+                r#"etcd should accept a put of key "{key}" with value "{value}""#,
+                "performs the put again on every attempt and passes once the server accepts it; an accepted put really writes, so under polling it may write more than once",
+                NONE,
+            ),
+            Self::RefusePut => (
+                r#"etcd should refuse a put of key "{key}" with "{code}""#,
+                "puts an empty value again on every attempt and passes once the server refuses it with this gRPC code (a name as tonic spells it: PermissionDenied, Unavailable, ...); a failure on the client side is never a refusal, and a put the server accepts really writes",
+                NONE,
+            ),
+            Self::AcceptRead => (
+                r#"etcd should accept a read of key "{key}""#,
+                "reads the key (linearizable) again on every attempt and passes once the server answers; a key that does not exist is an answer",
+                NONE,
+            ),
+            Self::AcceptReadSerializable => (
+                r#"etcd should accept a read of key "{key}" serializable"#,
+                "reads the key from the node that answers, without asking the leader, and passes once it answers; a key that does not exist is an answer",
+                NONE,
+            ),
+            Self::RefuseRead => (
+                r#"etcd should refuse a read of key "{key}" with "{code}""#,
+                "reads the key (linearizable) again on every attempt and passes once the server refuses it with this gRPC code (a name as tonic spells it: PermissionDenied, Unavailable, ...); a failure on the client side is never a refusal",
+                NONE,
+            ),
+            Self::RefuseReadSerializable => (
+                r#"etcd should refuse a read of key "{key}" serializable with "{code}""#,
+                "reads the key without asking the leader again on every attempt and passes once the server refuses it with this gRPC code (a name as tonic spells it: PermissionDenied, Unavailable, ...); a failure on the client side is never a refusal",
+                NONE,
+            ),
+            Self::RefuseCompact => (
+                "etcd should refuse a compaction up to revision {rev:uint} with \"{code}\"",
+                "compacts up to the revision again on every attempt and passes once the server refuses it with this gRPC code (a name as tonic spells it: PermissionDenied, Unavailable, ...); a compaction the server accepts really compacts, so keep such files in a @serial chain",
+                NONE,
+            ),
+            _ => unreachable!("not an accept / refuse step"),
         }
     }
 
@@ -315,7 +408,12 @@ pub fn validate(index: u32, request: &str) -> String {
     if step == Step::DeletePrefix && request["args"][0] == "" {
         return reply::err(EMPTY_PREFIX, &[]);
     }
-    if step.is_node() {
+    if step.is_expect() {
+        let checked = Request::parse(&request.to_string()).and_then(|r| expect::validate(step, &r));
+        if let Err(error) = checked {
+            return reply::err(error, &[]);
+        }
+    } else if step.is_node() {
         let checked = Request::parse(&request.to_string()).and_then(|r| node::validate(step, &r));
         if let Err(error) = checked {
             return reply::err(error, &[]);
@@ -362,7 +460,7 @@ mod tests {
             let found = Step::from_index(u32::try_from(index).expect("small")).expect("step");
             assert!(found == *step);
         }
-        assert!(Step::from_index(23).is_none());
+        assert!(Step::from_index(30).is_none());
     }
 
     #[test]
