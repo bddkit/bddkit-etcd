@@ -13,6 +13,9 @@ env:
   # The host the plugin is tested against: a released bddkit. Bump it
   # deliberately, as its own commit, so a failure after the bump is attributable.
   HOST_TAG: v0.5.0
+  # The bddkit-exec release that starts and kills the nodes of the failover
+  # example, installed from its release as a user would.
+  EXEC_TAG: 0.4.0
 
 jobs:
   lint:
@@ -85,21 +88,32 @@ jobs:
           cargo install --git https://github.com/bddkit/bddkit --tag "$HOST_TAG"
           --locked --root "$RUNNER_TEMP/bddkit-host" bddkit
 
-      # The cluster tests start three real etcd processes of the matrix's
-      # version, so they need the binary and not an image.
-      - name: Cache the etcd binary
+      # The cluster tests and the failover example start three real etcd
+      # processes of the matrix's version, so they need the binaries and not an
+      # image: `etcd`, and `etcdctl` for `move-leader`. The key names both, so a
+      # cache saved with `etcd` alone is not restored.
+      - name: Cache the etcd binaries
         id: etcd-bin
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/etcd-bin
-          key: etcd-bin-${{ matrix.etcd }}-${{ runner.os }}
+          key: etcd-bin-etcdctl-${{ matrix.etcd }}-${{ runner.os }}
       - name: Download etcd
         if: steps.etcd-bin.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/etcd-bin"
           name="etcd-${{ matrix.etcd }}-linux-amd64"
           curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${{ matrix.etcd }}/$name.tar.gz" \
-            | tar xz -C "$RUNNER_TEMP/etcd-bin" --strip-components=1 "$name/etcd"
+            | tar xz -C "$RUNNER_TEMP/etcd-bin" --strip-components=1 "$name/etcd" "$name/etcdctl"
+
+      # The failover example needs the exec plugin, installed from its release
+      # into a directory of its own.
+      - name: Install the exec plugin
+        run: |
+          dir="$RUNNER_TEMP/exec-plugin"
+          mkdir -p "$dir"
+          "$RUNNER_TEMP/bddkit-host/bin/bddkit" plugin install "bddkit/bddkit-exec@$EXEC_TAG" --bddkit-dir "$dir"
+          echo "BDDKIT_EXEC_PLUGIN=$dir/plugins/bddkit-exec/$EXEC_TAG/libbddkit_exec.so" >> "$GITHUB_ENV"
 
       # --wait returns once the healthcheck passes.
       - name: Start etcd
@@ -114,3 +128,19 @@ jobs:
           export BDDKIT_TEST_ETCD_WIPE=1
           export BDDKIT_TEST_ETCD_BIN="$RUNNER_TEMP/etcd-bin/etcd"
           cargo test --locked
+
+      # A failover is a race against elections: once green proves little, so the
+      # example runs ten times in a row, and one red run fails the job.
+      - name: Failover example, ten runs in a row
+        run: |
+          export PATH="$RUNNER_TEMP/etcd-bin:$PATH"
+          cargo build --locked
+          dir="$RUNNER_TEMP/failover-lock"
+          mkdir -p "$dir"
+          printf 'plugin:\n  - name: etcd\n    path: %s\n  - name: exec\n    path: %s\n' \
+            "$PWD/target/debug/libbddkit_etcd.so" "$BDDKIT_EXEC_PLUGIN" > "$dir/plugins.yaml"
+          for run in $(seq 10); do
+            echo "::group::run $run of 10"
+            "$RUNNER_TEMP/bddkit-host/bin/bddkit" run --config examples/cluster.yaml --bddkit-dir "$dir"
+            echo "::endgroup::"
+          done
