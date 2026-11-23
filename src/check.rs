@@ -119,7 +119,7 @@ pub enum Check {
     },
 }
 
-fn is_slot(text: &str) -> bool {
+pub(crate) fn is_slot(text: &str) -> bool {
     text.contains("<<")
 }
 
@@ -251,7 +251,13 @@ pub fn plan(step: Step, request: &Request) -> Result<Check, StepError> {
         | Step::Get
         | Step::DeleteKey
         | Step::DeletePrefix
-        | Step::DeleteAll => Err(StepError::input("not an assertion")),
+        | Step::DeleteAll
+        | Step::GetSerializable
+        | Step::ComputeHash
+        | Step::Leader
+        | Step::NotLeader
+        | Step::Reached
+        | Step::HashIs => Err(StepError::input("not an assertion")),
     }
 }
 

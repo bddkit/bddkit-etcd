@@ -57,15 +57,16 @@ fn with_slack(options: ConnectOptions, config: &Config) -> ConnectOptions {
 
 /// What every step's client is built with. The token is refreshed when the
 /// server calls it invalid (an idle file outlives it, a member restart drops
-/// it), because the client lives as long as the feature file. `require_leader` is on every
-/// request: without it a cluster that lost its leader holds the request until
-/// the server's own timeout, and the client's fires first as `Cancelled`
-/// instead of `Unavailable`. The probe leaves it off, because `Status` is
-/// answered by a node with no leader too.
-pub fn step_options(config: &Config) -> Result<ConnectOptions, String> {
+/// it), because the client lives as long as the feature file. `require_leader`
+/// is on every request of the leader client: without it a cluster that lost
+/// its leader holds the request until the server's own timeout, and the
+/// client's fires first as `Cancelled` instead of `Unavailable`. The probe
+/// and the node steps leave it off, because `Status` is answered by a node
+/// with no leader too.
+pub fn step_options(config: &Config, require_leader: bool) -> Result<ConnectOptions, String> {
     Ok(with_slack(connect_options(config)?, config)
         .with_auto_token_refresh(true)
-        .with_require_leader(true))
+        .with_require_leader(require_leader))
 }
 
 /// `Status` on every endpoint, each reached with a client of its own: one
