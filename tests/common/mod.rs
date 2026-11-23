@@ -11,6 +11,8 @@
     reason = "each test binary uses a part of this module; `allow-*-in-tests` covers only `#[test]` functions, not the helpers here"
 )]
 
+pub mod cluster;
+
 use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -274,7 +276,7 @@ async fn admin(user: Option<(&str, &str)>) -> etcd_client::Client {
         .expect("connect to the secure etcd (is it up? docker compose up --wait etcd-auth)")
 }
 
-fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+pub fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::runtime::Runtime::new()
         .expect("runtime")
         .block_on(future)
