@@ -549,7 +549,17 @@ pub fn plan(step: Step, request: &Request) -> Result<Watch, StepError> {
         | Step::AcceptReadSerializable
         | Step::RefuseRead
         | Step::RefuseReadSerializable
-        | Step::RefuseCompact => return Err(StepError::input("not a watch step")),
+        | Step::RefuseCompact
+        | Step::LeaseGrant
+        | Step::LeaseKeep
+        | Step::LeaseStop
+        | Step::LeaseRevoke
+        | Step::PutLeased
+        | Step::LeaseAlive
+        | Step::LeaseExpired
+        | Step::LeaseAliveId
+        | Step::LeaseExpiredId
+        | Step::LeaseHolds => return Err(StepError::input("not a watch step")),
     })
 }
 
@@ -784,6 +794,7 @@ impl State {
 mod resume;
 mod run;
 
+pub(crate) use resume::{FIRST_WAIT, LONGEST_WAIT};
 pub use run::{Watches, perform};
 
 #[cfg(test)]

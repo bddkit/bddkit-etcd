@@ -275,6 +275,16 @@ pub fn plan(step: Step, request: &Request) -> Result<Check, StepError> {
         | Step::WatchedCount
         | Step::WatchedEvents
         | Step::WatchResumed
+        | Step::LeaseGrant
+        | Step::LeaseKeep
+        | Step::LeaseStop
+        | Step::LeaseRevoke
+        | Step::PutLeased
+        | Step::LeaseAlive
+        | Step::LeaseExpired
+        | Step::LeaseAliveId
+        | Step::LeaseExpiredId
+        | Step::LeaseHolds
         | Step::WatchResumedTimes => Err(StepError::input("not an assertion")),
     }
 }

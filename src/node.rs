@@ -117,6 +117,16 @@ pub fn plan(step: Step, request: &Request, endpoints: usize) -> Result<Node, Ste
         | Step::WatchedCount
         | Step::WatchedEvents
         | Step::WatchResumed
+        | Step::LeaseGrant
+        | Step::LeaseKeep
+        | Step::LeaseStop
+        | Step::LeaseRevoke
+        | Step::PutLeased
+        | Step::LeaseAlive
+        | Step::LeaseExpired
+        | Step::LeaseAliveId
+        | Step::LeaseExpiredId
+        | Step::LeaseHolds
         | Step::WatchResumedTimes => return Err(StepError::input("not a node step")),
     })
 }

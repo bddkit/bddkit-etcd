@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use crate::check;
 use crate::expect;
+use crate::lease;
 use crate::node;
 use crate::ops::Request;
 use crate::reply;
@@ -55,10 +56,20 @@ pub enum Step {
     WatchedEvents,
     WatchResumed,
     WatchResumedTimes,
+    LeaseGrant,
+    LeaseKeep,
+    LeaseStop,
+    LeaseRevoke,
+    PutLeased,
+    LeaseAlive,
+    LeaseExpired,
+    LeaseAliveId,
+    LeaseExpiredId,
+    LeaseHolds,
 }
 
 /// In the order the host indexes them.
-const ALL: [Step; 41] = [
+const ALL: [Step; 51] = [
     Step::Put,
     Step::PutDocString,
     Step::Get,
@@ -100,6 +111,16 @@ const ALL: [Step; 41] = [
     Step::WatchedEvents,
     Step::WatchResumed,
     Step::WatchResumedTimes,
+    Step::LeaseGrant,
+    Step::LeaseKeep,
+    Step::LeaseStop,
+    Step::LeaseRevoke,
+    Step::PutLeased,
+    Step::LeaseAlive,
+    Step::LeaseExpired,
+    Step::LeaseAliveId,
+    Step::LeaseExpiredId,
+    Step::LeaseHolds,
 ];
 
 struct Spec {
@@ -114,6 +135,7 @@ const NONE: &[&str] = &[];
 const REVISION: &[&str] = &["etcd_revision"];
 const DELETED: &[&str] = &["etcd_revision", "etcd_deleted"];
 const HASH: &[&str] = &["{name}"];
+const LEASE: &[&str] = &["etcd_lease_{name}"];
 const WATCH: &[&str] = &["etcd_watch_{name}_revision"];
 const READ: &[&str] = &[
     "etcd_value",
@@ -144,7 +166,12 @@ impl Step {
             | Self::WatchPrefix
             | Self::WatchKeyFrom
             | Self::WatchPrefixFrom
-            | Self::WatchCancel => false,
+            | Self::WatchCancel
+            | Self::LeaseGrant
+            | Self::LeaseKeep
+            | Self::LeaseStop
+            | Self::LeaseRevoke
+            | Self::PutLeased => false,
             Self::Exists
             | Self::Absent
             | Self::HasValue
@@ -172,7 +199,12 @@ impl Step {
             | Self::WatchedCount
             | Self::WatchedEvents
             | Self::WatchResumed
-            | Self::WatchResumedTimes => true,
+            | Self::WatchResumedTimes
+            | Self::LeaseAlive
+            | Self::LeaseExpired
+            | Self::LeaseAliveId
+            | Self::LeaseExpiredId
+            | Self::LeaseHolds => true,
         }
     }
 
@@ -213,6 +245,23 @@ impl Step {
                 | Self::WatchedEvents
                 | Self::WatchResumed
                 | Self::WatchResumedTimes
+        )
+    }
+
+    /// The steps about leases, see `lease.rs`.
+    pub fn is_lease(self) -> bool {
+        matches!(
+            self,
+            Self::LeaseGrant
+                | Self::LeaseKeep
+                | Self::LeaseStop
+                | Self::LeaseRevoke
+                | Self::PutLeased
+                | Self::LeaseAlive
+                | Self::LeaseExpired
+                | Self::LeaseAliveId
+                | Self::LeaseExpiredId
+                | Self::LeaseHolds
         )
     }
 
@@ -304,6 +353,16 @@ impl Step {
             | Self::WatchedEvents
             | Self::WatchResumed
             | Self::WatchResumedTimes => self.watch_spec(),
+            Self::LeaseGrant
+            | Self::LeaseKeep
+            | Self::LeaseStop
+            | Self::LeaseRevoke
+            | Self::PutLeased
+            | Self::LeaseAlive
+            | Self::LeaseExpired
+            | Self::LeaseAliveId
+            | Self::LeaseExpiredId
+            | Self::LeaseHolds => self.lease_spec(),
         };
         Spec {
             expression,
@@ -475,6 +534,63 @@ impl Step {
         }
     }
 
+    /// The lease steps, kept apart so `spec` stays short.
+    fn lease_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
+        match self {
+            Self::LeaseGrant => (
+                r#"I grant etcd lease "{name}" with TTL {seconds:uint} seconds"#,
+                "grants a lease and stores its ID, in decimal, in etcd_lease_<name>; the name is taken until the scenario ends and belongs to this instance; the server may raise a TTL below its minimum",
+                LEASE,
+            ),
+            Self::LeaseKeep => (
+                r#"I keep etcd lease "{name}" alive"#,
+                "sends a keepalive every third of the granted TTL until the scenario ends, I stop keeping it alive, or I revoke it; a stream that breaks is opened again by itself; fails when the lease is already gone",
+                NONE,
+            ),
+            Self::LeaseStop => (
+                r#"I stop keeping etcd lease "{name}" alive"#,
+                "stops the keepalive of a lease, which then expires after its TTL; the lease keeps its name",
+                NONE,
+            ),
+            Self::LeaseRevoke => (
+                r#"I revoke etcd lease "{name}""#,
+                "revokes a lease and deletes the keys attached to it, and stops its keepalive; the name stays known, so it should have expired afterwards",
+                NONE,
+            ),
+            Self::PutLeased => (
+                r#"I put etcd key "{key}" with value "{value}" under lease "{name}""#,
+                "writes a key attached to a lease of this instance, and stores the revision of the response in etcd_revision; the key goes when the lease does",
+                REVISION,
+            ),
+            Self::LeaseAlive => (
+                r#"etcd lease "{name}" should be alive"#,
+                "asks the server for the lease again on every attempt and passes until the server no longer has the lease (a lease with under a second left is still alive); a lease that is gone is final, it never comes back",
+                NONE,
+            ),
+            Self::LeaseExpired => (
+                r#"etcd lease "{name}" should have expired"#,
+                "asks the server for the lease again on every attempt and passes once the server no longer has the lease (a TTL below zero, or a refusal that it was not found); not yet while it is alive",
+                NONE,
+            ),
+            Self::LeaseAliveId => (
+                "etcd lease with ID {id:uint} should be alive",
+                "as the same step by name, for a lease of any instance or scenario, by the decimal ID",
+                NONE,
+            ),
+            Self::LeaseExpiredId => (
+                "etcd lease with ID {id:uint} should have expired",
+                "as the same step by name, for a lease of any instance or scenario, by the decimal ID",
+                NONE,
+            ),
+            Self::LeaseHolds => (
+                r#"etcd lease "{name}" should hold {n:uint} keys"#,
+                "asks the server which keys are attached to the lease on every attempt and passes when there are exactly this many; not yet while the count differs, a failure once the lease has expired",
+                NONE,
+            ),
+            _ => unreachable!("not a lease step"),
+        }
+    }
+
     /// The steps of the cluster, kept apart so `spec` stays short.
     fn cluster_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
         match self {
@@ -562,6 +678,11 @@ pub fn validate(index: u32, request: &str) -> String {
         if let Err(error) = checked {
             return reply::err(error, &[]);
         }
+    } else if step.is_lease() {
+        let checked = Request::parse(&request.to_string()).and_then(|r| lease::validate(step, &r));
+        if let Err(error) = checked {
+            return reply::err(error, &[]);
+        }
     } else if step.is_assertion() {
         let checked =
             Request::parse(&request.to_string()).and_then(|parsed| check::validate(step, &parsed));
@@ -604,7 +725,7 @@ mod tests {
             let found = Step::from_index(u32::try_from(index).expect("small")).expect("step");
             assert!(found == *step);
         }
-        assert!(Step::from_index(41).is_none());
+        assert!(Step::from_index(51).is_none());
     }
 
     #[test]

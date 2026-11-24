@@ -9,6 +9,7 @@ mod error;
 mod evidence;
 mod expect;
 mod instance;
+mod lease;
 mod node;
 mod ops;
 mod reply;
@@ -225,7 +226,8 @@ pub extern "C" fn bddkit_reset_scenario(handle: u64) -> *mut c_char {
         let Some(instance) = instance else {
             return reply::err("unknown handle", &[]);
         };
-        // Every watch task is stopped, so none outlives the scenario.
+        // Every watch and keepalive task is stopped, so none outlives the
+        // scenario, and the leases of the scenario are revoked.
         match runtime::block_on(async {
             instance.reset().await;
             Ok(())
@@ -243,6 +245,12 @@ pub fn watch_tasks(handle: u64) -> Option<Arc<AtomicUsize>> {
     instances().get(&handle).map(|i| i.watches.running())
 }
 
+/// How many keepalive tasks of the handle are alive, for the tests.
+#[doc(hidden)]
+pub fn lease_tasks(handle: u64) -> Option<Arc<AtomicUsize>> {
+    instances().get(&handle).map(|i| i.leases.running())
+}
+
 /// The last operation of the scenario, for the dump of any failing step.
 #[unsafe(no_mangle)]
 pub extern "C" fn bddkit_failure_context(handle: u64) -> *mut c_char {
@@ -253,6 +261,7 @@ pub extern "C" fn bddkit_failure_context(handle: u64) -> *mut c_char {
         if let Some(instance) = &instance {
             let (watches, values) = instance.watches.context();
             diagnostics.extend(watches);
+            diagnostics.extend(instance.leases.context());
             scan.extend(values);
         }
         reply::failure_context(&diagnostics, &scan)
@@ -266,9 +275,10 @@ pub extern "C" fn bddkit_drop_instance(handle: u64) -> *mut c_char {
         let Some(instance) = removed else {
             return reply::err("unknown handle", &[]);
         };
-        // It waits until the watch tasks have stopped.
+        // It waits until the watch and keepalive tasks have stopped.
         match runtime::block_on(async {
             instance.watches.stop_all().await;
+            instance.leases.stop_all().await;
             Ok(())
         }) {
             Ok(()) => reply::ok(),

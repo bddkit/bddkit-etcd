@@ -14,6 +14,7 @@ use crate::error::{Class, StepError};
 use crate::evidence::{Record, base64, shown};
 use crate::expect::{self, Expect};
 use crate::instance::{Instance, Last};
+use crate::lease::{self, Lease};
 use crate::node::{self, Node};
 use crate::reply;
 use crate::steps::{EMPTY_PREFIX, Step};
@@ -164,6 +165,16 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
         | Step::WatchedCount
         | Step::WatchedEvents
         | Step::WatchResumed
+        | Step::LeaseGrant
+        | Step::LeaseKeep
+        | Step::LeaseStop
+        | Step::LeaseRevoke
+        | Step::PutLeased
+        | Step::LeaseAlive
+        | Step::LeaseExpired
+        | Step::LeaseAliveId
+        | Step::LeaseExpiredId
+        | Step::LeaseHolds
         | Step::WatchResumedTimes => return Err(StepError::input("not an action")),
     })
 }
@@ -176,6 +187,7 @@ enum Op {
     Node(Node),
     Expect(Expect),
     Watch(Watch),
+    Lease(Lease),
 }
 
 impl Op {
@@ -189,7 +201,7 @@ impl Op {
             | Self::Act(Action::Get {
                 serializable: true, ..
             }) => true,
-            Self::Act(_) | Self::Check(_) | Self::Watch(_) => false,
+            Self::Act(_) | Self::Check(_) | Self::Watch(_) | Self::Lease(_) => false,
         }
     }
 }
@@ -198,6 +210,8 @@ fn plan_op(step: Step, request: &Request, instance: &Instance) -> Result<Op, Ste
     let endpoints = instance.config.endpoints.len();
     if step.is_watch() {
         watch::plan(step, request).map(Op::Watch)
+    } else if step.is_lease() {
+        lease::plan(step, request).map(Op::Lease)
     } else if step.is_expect() {
         expect::plan(step, request).map(Op::Expect)
     } else if step.is_node() {
@@ -216,6 +230,7 @@ fn record_for(op: &Op, instance: &str) -> Record {
         Op::Node(node) => node::record_for(node, instance),
         Op::Expect(expect) => expect::record_for(expect, instance),
         Op::Watch(watch) => watch::record_for(watch, instance),
+        Op::Lease(lease) => lease::record_for(lease, instance),
     }
 }
 
@@ -261,7 +276,7 @@ pub fn header(header: Option<&ResponseHeader>) -> Result<&ResponseHeader, StepEr
     })
 }
 
-fn revision_vars(header: &ResponseHeader) -> Vars {
+pub(crate) fn revision_vars(header: &ResponseHeader) -> Vars {
     BTreeMap::from([("etcd_revision".to_string(), header.revision().to_string())])
 }
 
@@ -353,8 +368,8 @@ async fn perform(
             .map(|()| Vars::new()),
         Op::Node(node) => node::perform(client, tls, node, record).await,
         Op::Expect(expect) => expect::perform(client, tls, expect, record).await,
-        Op::Watch(_) => Err(StepError::input(
-            "a watch step never runs on a client of its own",
+        Op::Watch(_) | Op::Lease(_) => Err(StepError::input(
+            "a watch or lease step never runs on a client of its own",
         )),
     }
 }
@@ -390,6 +405,14 @@ pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
             .await
             .map_err(|_| no_response())??;
         let tls = instance.config.tls;
+        if let Op::Lease(lease) = &op {
+            return tokio::time::timeout(
+                limit,
+                lease::perform(instance, client, lease, &mut record),
+            )
+            .await
+            .map_err(|_| no_response())?;
+        }
         tokio::time::timeout(limit, perform(client, tls, &op, &mut record))
             .await
             .map_err(|_| no_response())?
