@@ -178,5 +178,5 @@ fn the_failover_example_passes_on_three_real_nodes() {
         .expect("bddkit");
     let text = combined(&out);
     assert_eq!(out.status.code(), Some(0), "{text}");
-    assert!(text.contains("scenarios: 2, failed: 0"), "{text}");
+    assert!(text.contains("scenarios: 3, failed: 0"), "{text}");
 }

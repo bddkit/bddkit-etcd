@@ -1,6 +1,6 @@
 # bddkit-etcd
 
-A bddkit plugin that runs steps against any etcd v3 compatible server (keys, the nodes of a cluster and refusals today; watches, leases and transactions are planned) as a resource group.
+A bddkit plugin that runs steps against any etcd v3 compatible server (keys, the nodes of a cluster, refusals and watches today; leases and transactions are planned) as a resource group.
 
 It speaks the etcd v3 gRPC API, so it serves a team checking what its service wrote to etcd and a team building an etcd-compatible server alike. Tested against etcd 3.5 and 3.6.
 
@@ -37,7 +37,7 @@ default_etcd: main
 | `tls_cert`, `tls_key` | client certificate and key for mutual TLS; each needs the other |
 | `tls_server_name` | the name to verify the server certificate against, when the endpoint is an IP address |
 | `timeout_secs` | limit of connecting and of one request, default 5 |
-| `watch_buffer_events` | events one watch keeps before it fails, default 10000; for the planned watch steps |
+| `watch_buffer_events` | events one watch keeps before it fails, default 10000; it caps the count, not the size, see [Watches](#watches) |
 | `options` | `polling.timeout_secs` and `polling.interval_ms` for eventual assertions against this instance |
 
 A certificate path is read from the working directory of `bddkit run`, not from the directory of the config: the paths above work when `bddkit run` starts in the project root.
@@ -72,7 +72,7 @@ bddkit run --config examples/etcd.yaml --default etcd=second
 
 Every assertion reads the server again on each attempt, so `I expect the next assertion to pass within 5 seconds` waits for a key that someone else writes.
 
-The steps of a cluster and of refusals are in their own sections below: [A node of a cluster](#a-node-of-a-cluster) and [Refusals](#refusals).
+The steps of a cluster, of refusals and of watches are in their own sections below: [A node of a cluster](#a-node-of-a-cluster), [Refusals](#refusals) and [Watches](#watches).
 
 Variables a step sets, readable as `<<...>>`:
 
@@ -124,6 +124,40 @@ What an attempt leaves behind:
 - `etcd should refuse a compaction …` really compacts when the server accepts it, and a compaction cannot be undone. Files with such steps belong in a `@serial(<name>)` chain.
 - A failover file breaks the cluster it runs on, and a `@serial` chain orders only the files that carry its tag, so every file that uses that cluster belongs in the same `@serial(<name>)` chain.
 
+## Watches
+
+A watch is opened by name and keeps every event it receives until the scenario ends. It belongs to the instance that was selected when it was opened, so the assertions on it need that instance selected, and the next scenario starts with no watch. `I watch …` returns once the server has confirmed the watch, so a write in the next step is in the stream (a watch `from revision` also waits up to 500 ms for the server to turn a compacted revision down), and the assertions only read what the watch has collected, never the server, so a polled assertion waits for an event.
+
+| Step | Effect |
+|---|---|
+| `I watch etcd key "<key>" as "<name>"` / `I watch etcd keys with prefix "<prefix>" as "<name>"` | opens a watch on a key / on every key under a prefix; sets `etcd_watch_<name>_revision` to the revision of the confirmation |
+| `… as "<name>" from revision <rev>` | the same, and first replays the writes from this revision on; fails the step when the server has compacted it, or the first assertion on the watch when the server turns it down later than 500 ms |
+| `I cancel etcd watch "<name>"` | stops the watch; what it received stays readable until the scenario ends |
+| `etcd watch "<name>" should have received a PUT of "<key>" with value "<value>"` / `a DELETE of "<key>"` | any event of the history is this one |
+| `etcd watch "<name>" should have received <n> events` | the history holds exactly this many events: not yet while it holds fewer, a failure once it holds more |
+| `etcd watch "<name>" should have received events:` | a table that equals the whole history, in order. The columns, in any order: `type` (`PUT` or `DELETE`), `key`, `value`, `prev_value`, `mod_revision`, `version`. The history may still be a beginning of the rows (not yet), and differs from them for good once it does not match |
+| `etcd watch "<name>" should have been resumed` / `… should have been resumed <n> times` | the stream broke and a new one was confirmed, at least once / exactly this many times, a failure once there are more |
+
+How to write a watch scenario that does not flake:
+
+- The assertions never consume events: a retried attempt sees the same history plus the new events. Isolation comes from a unique key or prefix (`/<suite>/<<run_id>>/…`), as in [Running in parallel](#running-in-parallel).
+- An empty key or prefix is refused (`input`), a literal one before the first request.
+- `prev_value` is the value before the event, and is empty when the key had none, as for the first PUT of a key. An empty `prev_value` therefore does not tell a missing previous value from an empty one.
+- "No event arrived" is a race on a live stream: the event may be on its way. Write a marker key into the watched prefix after the quiet period, and assert the exact list with the marker last. Events come in revision order, so everything written before the marker is already in the history when the marker is (`examples/features/watch.feature`).
+- A put retried under polling (`etcd should accept a put …`) may write more than once, so assert such keys with `a PUT of …` and not with an exact list.
+- A cancelled watch keeps its history and its name: the name stays taken until the scenario ends, and an assertion that misses on a cancelled watch is final, not a wait.
+- `watch_buffer_events` caps the number of events a watch keeps, not their size, so a few huge values can still use a lot of memory.
+
+What breaks a stream, and what the plugin does about it:
+
+- A break is any stream error or close, and a cancel that is not for compaction or permission. A watch goes through `require_leader`: a node that lost the quorum ends the stream, and the plugin opens it again, with a backoff from 100 ms to 1 s, until the scenario ends. A watch that cannot be opened again is a watch that has not received more yet, so a polled assertion keeps waiting and fails with the class of the break, `db_connection` when the server stayed down.
+- The new stream starts at the revision after the last event, so no write of the gap is lost. A watch that opened `from revision` and has received nothing resumes from that revision, and one that has received nothing and had no revision resumes from the revision of its confirmation plus one.
+- `should have been resumed` is the proof that the break happened: without it a scenario can pass on a stream that never broke. A resume counts when the server confirmed the new stream.
+- A terminal state ends the watch for good, and the next assertion on it fails with the reason: the server cancelled it because its revision was compacted or because the user may not read the key, or the watch holds `watch_buffer_events` events and another one arrived, or an event arrived out of order or twice (class `assertion`). Nothing is dropped silently.
+- A watch that has been quiet for longer than the server's compaction interval can fail on resume: its resume point, the revision after its last event, may be compacted by the time the stream is opened again, and the watch then ends for good. Keep the server's compaction retention longer than the quiet time plus the outage you test.
+- A gRPC `PermissionDenied` status of the stream (as opposed to a cancel) is retried forever, so a polled assertion runs out with class `db_statement`.
+- `from revision 0` is refused, and a watch name is made of letters, digits and underscores, so that `etcd_watch_<name>_revision` is a variable.
+
 ## Failures
 
 The class is set where the error is born and never read back from its text. It shows in the console summary, in the `type` of a JUnit report and in the `kind` of the event stream:
@@ -158,6 +192,8 @@ bddkit run --config examples/etcd.yaml --default etcd=second
 bddkit run --config examples/failing.yaml
 ```
 
+`examples/features/watch.feature` is the watch example: the whole history of a prefix with `<<etcd_revision>>` in the table, the marker recipe, a replay from a revision and a cancel.
+
 `examples/failing.yaml` fails four scenarios on purpose (a wrong value, a missing key, a server that is down, refused credentials) and exits 1; `tests/examples.rs` checks what it prints.
 
 `examples/cluster.yaml` runs a failover on three nodes that the [exec plugin](https://github.com/bddkit/bddkit-exec) starts and kills, and needs no server:
@@ -171,5 +207,7 @@ It needs the `etcd` and `etcdctl` binaries of an etcd release on `PATH`, and the
 
 - The leader is chosen with `etcdctl move-leader`, never by timing, and killed. The survivors elect another leader, which a polled assertion waits for, a write is accepted again, and the key written before the failover is still there.
 - Two of the three nodes are killed. Writes are refused with `Unavailable`, and a serializable read of a key written earlier is still served.
+
+`examples/cluster/watch.feature` is in the same chain and has one scenario: a watch on node 1 alone, node 1 killed on purpose (a watch on a follower that stays in the quorum is not broken by a change of leader), a key written through node 2 while the watch has no stream, node 1 restarted under a new process name (a name is used once per scenario). Under polling the watch has received the key and `should have been resumed 1 times` passes.
 
 A passing scenario ends by deleting the data directories of its nodes; a failed one leaves them in the run's workspace. A killed node gets no time to hand its leadership over (`stop_grace_secs: 0` in the config), so what the scenarios see is a node that is gone. CI runs the example on etcd 3.5 and 3.6, ten times in a row in each job.
