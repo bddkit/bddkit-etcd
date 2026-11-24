@@ -1,6 +1,6 @@
 # bddkit-etcd
 
-A bddkit plugin that runs steps against any etcd v3 compatible server (keys, the nodes of a cluster, refusals, watches, leases and transactions) as a resource group.
+A bddkit plugin that runs steps against any etcd v3 compatible server (keys and their history, compaction, the nodes of a cluster, refusals, watches, leases, transactions and logins) as a resource group.
 
 It speaks the etcd v3 gRPC API, so it serves a team checking what its service wrote to etcd and a team building an etcd-compatible server alike. Tested against etcd 3.5 and 3.6.
 
@@ -62,6 +62,8 @@ bddkit run --config examples/etcd.yaml --default etcd=second
 | `I delete etcd key "<key>"` | deletes a key |
 | `I delete etcd keys with prefix "<prefix>"` | deletes every key under the prefix; an empty prefix is refused |
 | `I delete all etcd keys` | clears the whole server, see Running in parallel |
+| `I get etcd key "<key>" at revision <rev>` | reads the key as it was at this revision and sets the variables of `I get`; fails when the key did not exist then, or when the server refuses the revision (`OutOfRange`: compacted, or not reached yet); revision 0 is refused (`input`), the server would read the latest |
+| `I compact etcd up to revision <rev>` | drops the history before the revision, so an older one can no longer be read; a revision already compacted, or not reached yet, fails as `OutOfRange` |
 | `etcd key "<key>" should exist` / `should not exist` | the key is there / is not |
 | `etcd key "<key>" should have value "<value>"` / `value:` | the value is exactly this text |
 | `etcd key "<key>" value should match "<regex>"` | the value matches the regular expression, not anchored |
@@ -72,13 +74,13 @@ bddkit run --config examples/etcd.yaml --default etcd=second
 
 Every assertion reads the server again on each attempt, so `I expect the next assertion to pass within 5 seconds` waits for a key that someone else writes.
 
-The steps of a cluster, of refusals, of watches, of leases and of transactions are in their own sections below: [A node of a cluster](#a-node-of-a-cluster), [Refusals](#refusals), [Watches](#watches), [Leases](#leases) and [Transactions](#transactions).
+The steps of a cluster, of refusals, of watches, of leases, of transactions and of logins are in their own sections below: [A node of a cluster](#a-node-of-a-cluster), [Refusals](#refusals), [Watches](#watches), [Leases](#leases), [Transactions](#transactions) and [Logins](#logins). [History and compaction](#history-and-compaction) says more about the two steps above.
 
 Variables a step sets, readable as `<<...>>`:
 
 - `etcd_revision` after every action: the revision of the server in the response.
 - `etcd_deleted` after a delete: the number of keys deleted.
-- `etcd_value`, `etcd_create_revision`, `etcd_mod_revision`, `etcd_version` and `etcd_lease` after `I get`.
+- `etcd_value`, `etcd_create_revision`, `etcd_mod_revision`, `etcd_version` and `etcd_lease` after `I get`. After `I get … at revision` `etcd_revision` is the server's revision when it answered, not the revision that was read: the revision of the value is `etcd_mod_revision`.
 
 A step that cannot publish one of its variables fails instead of leaving the old value: a value that is not UTF-8 fails `I get`, and so does a response with no header.
 
@@ -116,6 +118,8 @@ The one-endpoint rule is for these five. `I get etcd key "<key>" serializable` r
 | `etcd should accept a read of key "<key>"` / `… serializable` | the read is answered; a key that does not exist is an answer |
 | `etcd should refuse a read of key "<key>" with "<code>"` / `… serializable with "<code>"` | the read is refused with this code |
 | `etcd should refuse a compaction up to revision <rev> with "<code>"` | the compaction is refused with this code |
+| `etcd should refuse a read of key "<key>" at revision <rev> with "<code>"` | the read at the revision is refused with this code, `OutOfRange` for a revision that is compacted or not reached yet; revision 0 is refused as `input` |
+| `etcd should refuse authentication as "<user>" with password "<password>" with "<code>"` | the login is refused with this code, see [Logins](#logins) |
 
 What an attempt leaves behind:
 
@@ -218,6 +222,42 @@ What to know before writing one:
 - `del "" --prefix` is refused as an empty prefix (`input`), as in `I delete etcd keys with prefix`; `get "" --prefix` reads every key and is allowed.
 - `etcd should refuse a transaction …` really applies a transaction the server accepts, as `etcd should refuse a put …` does. Under polling an accepted transaction is applied again on every attempt, so use it without a wait or with idempotent operations.
 
+## History and compaction
+
+Every write has a revision, and the server keeps the history of its keys until a compaction drops it. `I get etcd key "<key>" at revision <rev>` reads a key as it was then, linearizable, so a revision the server has not reached yet is refused like a compacted one, with `OutOfRange`. Name the revision a write returned: `set variable "first" to "<<etcd_revision>>"` after the write, as in `examples/features/history.feature`.
+
+- `I compact etcd up to revision <rev>` keeps the revision it names readable and drops what is older. It is not physical: it does not wait for the backend to free the space. A revision that is already compacted, or not reached yet, fails as `OutOfRange` (`db_statement`).
+- A compaction acts on the whole server, so on every file that uses it: a read at an older revision fails there, and so does a watch `from revision` that is compacted. Compact only up to a revision your own file wrote, and give every file that compacts, or replays a watch from a revision, the same `@serial(<name>)` tag. The tag orders only the files that carry it, and the examples tag `history.feature` and `watch.feature` with `@serial(etcd-compaction)`.
+- There is no assertion on a key at a revision: read it with `I get … at revision` and compare the variables.
+
+## Logins
+
+`I authenticate to etcd as "<user>" with password "<password>"` logs in as another user for the rest of the scenario, on the selected instance only. It connects at once, so a refused password fails the step. The next scenario is back at the user of the config.
+
+| Step | Effect |
+|---|---|
+| `I authenticate to etcd as "<user>" with password "<password>"` | every later step of the selected instance goes through this user until the scenario ends; the password is masked in every output |
+| `etcd should refuse authentication as "<user>" with password "<password>" with "<code>"` | tries to log in again on every attempt and passes once the server refuses it with this code; changes nothing for the steps that follow |
+
+What to know:
+
+- Watches and leases opened before the login keep the user they were opened with. A lease or watch opened after it belongs to the login.
+- The reset at the end of the scenario revokes its leases through the client of the config's user (the login's own when the config's client was never built), so a lease granted after `I authenticate` is revoked as intended when the configured user is root. A configured user with fewer rights than the login cannot revoke it, and the lease and its keys stay until the TTL.
+- The code of a refused login differs between servers: etcd answers `InvalidArgument` for a wrong password or an unknown user, and some compatible servers answer `Unauthenticated`. A code is not checked against the server's list, only against the spelling of `tonic`.
+- A refusal is only what the server answers. A connection that failed is `db_connection`, and a login that failed on the client's side is never a refusal.
+- `examples/auth/rbac.feature` starts an etcd with the exec plugin and sets users and a role up with `etcdctl` before switching authentication on: a read-only user reads, a put is refused with `PermissionDenied`, and a wrong password is refused.
+
+## Comparing two servers
+
+One feature file run against two servers shows where they differ. Declare both as instances (`resources.etcd.<name>`) and run the file twice with `--default etcd=<name>`, as `examples/etcd.yaml` does with `main` and `second`, or select both in one scenario with `I use "<name>" etcd`: a value read from one is a variable the other is compared with. Keep the keys under `/<suite>/<<run_id>>/` so a run owns its keys on each.
+
+What not to compare between different implementations:
+
+- `HashKV`: how a server computes it is its own, so two implementations may differ for the same data. Compare it between the nodes of one cluster.
+- The code of a refused login (see [Logins](#logins)).
+- `LeaseTimeToLive` of a lease that is gone: etcd answers a TTL of -1, and a server may answer `NotFound`. The lease steps accept both, but a hand-written comparison of the number does not.
+- The response header: some servers fill it with constants, so `etcd_revision` and `should not be the leader` say little on them. Compare the values and the `etcd_mod_revision` of your own writes, never "it grew by one".
+
 ## Failures
 
 The class is set where the error is born and never read back from its text. It shows in the console summary, in the `type` of a JUnit report and in the `kind` of the event stream:
@@ -254,6 +294,8 @@ bddkit run --config examples/failing.yaml
 
 `examples/features/lease.feature` grants leases, puts keys under them, revokes one and lets another expire after `I stop keeping … alive`. `examples/features/transaction.feature` is the lock recipe on a transaction (`create("<key>") = "0"`: the first commit takes the lock, the second one finds it taken), a value from a variable in quotes and a compare that does not hold.
 
+`examples/features/history.feature` writes a key twice, reads it at the first revision, compacts, and shows the read at that revision refused with `OutOfRange`; it and `watch.feature` share a `@serial` chain, see [History and compaction](#history-and-compaction).
+
 `examples/features/watch.feature` is the watch example: the whole history of a prefix with `<<etcd_revision>>` in the table, the marker recipe, a replay from a revision and a cancel.
 
 `examples/failing.yaml` fails four scenarios on purpose (a wrong value, a missing key, a server that is down, refused credentials) and exits 1; `tests/examples.rs` checks what it prints.
@@ -273,5 +315,11 @@ It needs the `etcd` and `etcdctl` binaries of an etcd release on `PATH`, and the
 `examples/cluster/lease.feature` has one scenario: a lease kept alive through an instance with all three endpoints (`all` in `examples/cluster.yaml`), the leader moved to node 1 and killed, twice the TTL waited out, and the lease still alive when asked by its ID through node 2.
 
 `examples/cluster/watch.feature` has one scenario: a watch on node 1 alone, node 1 killed on purpose (a watch on a follower that stays in the quorum is not broken by a change of leader), a key written through node 2 while the watch has no stream, node 1 restarted under a new process name (a name is used once per scenario). Under polling the watch has received the key and `should have been resumed 1 times` passes.
+
+`examples/auth.yaml` runs one scenario file on an etcd of its own, with authentication on, and needs the same `bddkit plugin install exec` and `etcd` and `etcdctl` on `PATH`, and the ports 25021 and 25031 free:
+
+```sh
+bddkit run --config examples/auth.yaml
+```
 
 A passing scenario ends by deleting the data directories of its nodes; a failed one leaves them in the run's workspace. A killed node gets no time to hand its leadership over (`stop_grace_secs: 0` in the config), so what the scenarios see is a node that is gone. CI runs the example on etcd 3.5 and 3.6, ten times in a row in each job.
