@@ -1,6 +1,6 @@
 # bddkit-etcd
 
-A bddkit plugin that runs steps against any etcd v3 compatible server (keys, the nodes of a cluster, refusals and watches today; leases and transactions are planned) as a resource group.
+A bddkit plugin that runs steps against any etcd v3 compatible server (keys, the nodes of a cluster, refusals, watches, leases and transactions) as a resource group.
 
 It speaks the etcd v3 gRPC API, so it serves a team checking what its service wrote to etcd and a team building an etcd-compatible server alike. Tested against etcd 3.5 and 3.6.
 
@@ -72,7 +72,7 @@ bddkit run --config examples/etcd.yaml --default etcd=second
 
 Every assertion reads the server again on each attempt, so `I expect the next assertion to pass within 5 seconds` waits for a key that someone else writes.
 
-The steps of a cluster, of refusals and of watches are in their own sections below: [A node of a cluster](#a-node-of-a-cluster), [Refusals](#refusals) and [Watches](#watches).
+The steps of a cluster, of refusals, of watches, of leases and of transactions are in their own sections below: [A node of a cluster](#a-node-of-a-cluster), [Refusals](#refusals), [Watches](#watches), [Leases](#leases) and [Transactions](#transactions).
 
 Variables a step sets, readable as `<<...>>`:
 
@@ -158,6 +158,66 @@ What breaks a stream, and what the plugin does about it:
 - A gRPC `PermissionDenied` status of the stream (as opposed to a cancel) is retried forever, so a polled assertion runs out with class `db_statement`.
 - `from revision 0` is refused, and a watch name is made of letters, digits and underscores, so that `etcd_watch_<name>_revision` is a variable.
 
+## Leases
+
+A lease is granted by name and keeps the name until the scenario ends. It belongs to the instance that was selected when it was granted, so the steps by name need that instance selected, and the next scenario starts with no lease: the reset revokes the scenario's leases on the way out, best effort (at most a second for each, errors ignored), so a lease whose server is already gone is simply left to expire. A name is used once per scenario.
+
+| Step | Effect |
+|---|---|
+| `I grant etcd lease "<name>" with TTL <n> seconds` | grants a lease and sets `etcd_lease_<name>` to its ID; a TTL of 0 is refused |
+| `I put etcd key "<key>" with value "<value>" under lease "<name>"` | writes a key attached to the lease; the key goes when the lease does |
+| `I keep etcd lease "<name>" alive` | sends a keepalive every third of the granted TTL until the scenario ends, you stop it or you revoke the lease |
+| `I stop keeping etcd lease "<name>" alive` | stops the keepalive; the lease then lives its TTL out |
+| `I revoke etcd lease "<name>"` | revokes the lease and deletes the keys attached to it; the name stays known, so `should have expired` holds afterwards |
+| `etcd lease "<name>" should be alive` / `should have expired` | the server still has the lease / no longer has it |
+| `etcd lease with ID <id> should be alive` / `should have expired` | the same for a lease of any instance or scenario, by its decimal ID |
+| `etcd lease "<name>" should hold <n> keys` | exactly this many keys are attached to the lease |
+
+What the assertions mean:
+
+- A lease is gone when the server answers a TTL below zero, or `NotFound` (some servers answer that for a lease they do not have; etcd answers a TTL of -1). It is not gone at a TTL of 0: etcd counts whole seconds down and truncates, so 0 means under a second left, and a keepalive still saves the lease. `should have expired` is not yet while the lease is alive, so a polled assertion waits for the expiry.
+- `should be alive` asks the server on every attempt. A lease that is gone never comes back, so once it has been seen gone `should be alive` fails for good, with class `assertion`, and does not wait.
+- A keepalive or a revoke of a name that you already revoked is `input`, and so is `I stop keeping` on a lease nobody keeps. `I revoke` on a lease that expired on its own is answered `NotFound` by the server and fails with class `db_statement`. A keepalive of a lease that the server has already dropped is an `assertion`, final like `should be alive`.
+- A server raises a TTL below its minimum (about two seconds on a default etcd), so a short TTL may live longer than written. Wait for an expiry with a polled assertion, never for a number of seconds.
+- A keepalive reconnects silently, with the backoff of a watch resume (100 ms to 1 s), and ends when the server answers that the lease is gone. Through an instance with one endpoint it cannot move: while that node is down the keepalive keeps trying to reopen the stream, and the lease expires if the node stays away longer than the TTL (the keepalive ends once the node is back and the server says the lease is gone); through an instance with all the endpoints it moves to another node, and a lease asked by ID through any node is still alive (`examples/cluster/lease.feature`).
+- Lease IDs are decimal here, in `etcd_lease_<name>` and everywhere an ID is read, while `etcdctl` prints and reads them in hex. Convert before you compare with its output.
+
+## Transactions
+
+`I commit an etcd transaction:` takes a doc string in the format of `etcdctl txn`: compares, an empty line, the operations to run when they hold, an empty line, the operations to run when they do not. The compares and the failure branch are optional. One line break at the start of the doc string is removed, so a transaction with no compares starts with an empty first line, as in `examples/features/transaction.feature`.
+
+```gherkin
+When I commit an etcd transaction:
+  """
+  create("/locks/job") = "0"
+
+  put "/locks/job" "alice"
+
+  get "/locks/job"
+  """
+Then the etcd transaction should have succeeded
+```
+
+| Step | Effect |
+|---|---|
+| `I commit an etcd transaction:` | commits the doc string; sets `etcd_txn_succeeded` (`true` when the compares held) and `etcd_revision` |
+| `the etcd transaction should have succeeded` / `should have failed` | the compares of the last transaction of the scenario on this instance held / did not hold; reads what the commit kept and sends no request |
+| `etcd should refuse a transaction with "<code>":` | commits the doc string on every attempt and passes once the server refuses it with this gRPC code |
+
+The part of `etcdctl txn` the plugin takes:
+
+- Compares `value("<key>")`, `version`, `create`, `mod` and `lease`, each with `=`, `!=`, `<` or `>` and a value in double quotes; the short names `val`, `ver`, `c`, `m` and `l` work. A compare that is not true sends the failure branch and is not a failure of the step: assert it with `should have failed`, or read `etcd_txn_succeeded`.
+- Operations `put <key> <value>` (with `--lease=<id>`), `get <key>` and `del <key>`, which take a `<range_end>` after the key or `--prefix`. A token with a space, a quote or an empty text is in double quotes, with `\"` and `\\` inside. Nothing else of `etcdctl` is read: no interactive mode, no `--from-key`, no `--rev`.
+- What a `get` returned is in the evidence of the step, not in a variable.
+- A mismatch of `should have succeeded` with the branch that ran is a final `assertion`, and a transaction the server refused fails the commit itself (`db_statement`).
+
+What to know before writing one:
+
+- A `<<slot>>` belongs inside double quotes. The doc string is read after the variables are put in, so a value becomes text of the transaction, and a value that holds a double quote, a backslash or a line break breaks the compare it was put in (the error names the line, never the value). A literal is checked before the first request, a slot by shape and again once it has a value.
+- Lease IDs are decimal here too, `--lease=` included, while `etcdctl txn` reads them in hex: `put /k v --lease=<<etcd_lease_session>>` works, and an ID copied from `etcdctl` output usually fails to parse; a hex ID made only of digits is read as another lease.
+- `del "" --prefix` is refused as an empty prefix (`input`), as in `I delete etcd keys with prefix`; `get "" --prefix` reads every key and is allowed.
+- `etcd should refuse a transaction …` really applies a transaction the server accepts, as `etcd should refuse a put …` does. Under polling an accepted transaction is applied again on every attempt, so use it without a wait or with idempotent operations.
+
 ## Failures
 
 The class is set where the error is born and never read back from its text. It shows in the console summary, in the `type` of a JUnit report and in the `kind` of the event stream:
@@ -192,6 +252,8 @@ bddkit run --config examples/etcd.yaml --default etcd=second
 bddkit run --config examples/failing.yaml
 ```
 
+`examples/features/lease.feature` grants leases, puts keys under them, revokes one and lets another expire after `I stop keeping … alive`. `examples/features/transaction.feature` is the lock recipe on a transaction (`create("<key>") = "0"`: the first commit takes the lock, the second one finds it taken), a value from a variable in quotes and a compare that does not hold.
+
 `examples/features/watch.feature` is the watch example: the whole history of a prefix with `<<etcd_revision>>` in the table, the marker recipe, a replay from a revision and a cancel.
 
 `examples/failing.yaml` fails four scenarios on purpose (a wrong value, a missing key, a server that is down, refused credentials) and exits 1; `tests/examples.rs` checks what it prints.
@@ -203,11 +265,13 @@ bddkit plugin install exec
 bddkit run --config examples/cluster.yaml
 ```
 
-It needs the `etcd` and `etcdctl` binaries of an etcd release on `PATH`, and the ports 25001 to 25003 and 25011 to 25013 free. `examples/cluster/failover.feature` is tagged `@serial(etcd-cluster)` and has two scenarios, each on a cluster of its own:
+It needs the `etcd` and `etcdctl` binaries of an etcd release on `PATH`, and the ports 25001 to 25003 and 25011 to 25013 free. `examples/cluster/failover.feature` is tagged `@serial(etcd-cluster)` and has two scenarios, each on a cluster of its own, and shares its chain with two files that follow:
 
 - The leader is chosen with `etcdctl move-leader`, never by timing, and killed. The survivors elect another leader, which a polled assertion waits for, a write is accepted again, and the key written before the failover is still there.
 - Two of the three nodes are killed. Writes are refused with `Unavailable`, and a serializable read of a key written earlier is still served.
 
-`examples/cluster/watch.feature` is in the same chain and has one scenario: a watch on node 1 alone, node 1 killed on purpose (a watch on a follower that stays in the quorum is not broken by a change of leader), a key written through node 2 while the watch has no stream, node 1 restarted under a new process name (a name is used once per scenario). Under polling the watch has received the key and `should have been resumed 1 times` passes.
+`examples/cluster/lease.feature` has one scenario: a lease kept alive through an instance with all three endpoints (`all` in `examples/cluster.yaml`), the leader moved to node 1 and killed, twice the TTL waited out, and the lease still alive when asked by its ID through node 2.
+
+`examples/cluster/watch.feature` has one scenario: a watch on node 1 alone, node 1 killed on purpose (a watch on a follower that stays in the quorum is not broken by a change of leader), a key written through node 2 while the watch has no stream, node 1 restarted under a new process name (a name is used once per scenario). Under polling the watch has received the key and `should have been resumed 1 times` passes.
 
 A passing scenario ends by deleting the data directories of its nodes; a failed one leaves them in the run's workspace. A killed node gets no time to hand its leadership over (`stop_grace_secs: 0` in the config), so what the scenarios see is a node that is gone. CI runs the example on etcd 3.5 and 3.6, ten times in a row in each job.
