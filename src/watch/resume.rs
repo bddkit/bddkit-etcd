@@ -14,8 +14,8 @@ use crate::ops::no_response;
 
 /// The wait before the first attempt, doubled after each failure up to
 /// `LONGEST_WAIT`.
-pub(super) const FIRST_WAIT: Duration = Duration::from_millis(100);
-const LONGEST_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const FIRST_WAIT: Duration = Duration::from_millis(100);
+pub(crate) const LONGEST_WAIT: Duration = Duration::from_secs(1);
 
 /// What opening the same watch again takes.
 pub(super) struct Resume {

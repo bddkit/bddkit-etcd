@@ -157,6 +157,16 @@ pub fn plan(step: Step, request: &Request) -> Result<Expect, StepError> {
         | Step::WatchedCount
         | Step::WatchedEvents
         | Step::WatchResumed
+        | Step::LeaseGrant
+        | Step::LeaseKeep
+        | Step::LeaseStop
+        | Step::LeaseRevoke
+        | Step::PutLeased
+        | Step::LeaseAlive
+        | Step::LeaseExpired
+        | Step::LeaseAliveId
+        | Step::LeaseExpiredId
+        | Step::LeaseHolds
         | Step::WatchResumedTimes => return Err(StepError::input("not an accept / refuse step")),
     };
     Ok(Expect { call, wanted })
