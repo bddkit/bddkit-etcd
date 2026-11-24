@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use etcd_client::{Client, DeleteOptions, GetOptions, ResponseHeader};
 use serde_json::{Value, json};
 
+use crate::auth::{self, Auth};
 use crate::check::is_slot;
 use crate::check::{self, Check};
 use crate::client::request_failure;
@@ -252,6 +253,8 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
         | Step::TxnSucceeded
         | Step::TxnFailed
         | Step::TxnRefuse
+        | Step::Authenticate
+        | Step::RefuseAuth
         | Step::WatchResumedTimes => return Err(StepError::input("not an action")),
     })
 }
@@ -266,6 +269,7 @@ enum Op {
     Watch(Watch),
     Lease(Lease),
     Txn(Txn),
+    Auth(Auth),
 }
 
 impl Op {
@@ -279,7 +283,12 @@ impl Op {
             | Self::Act(Action::Get {
                 serializable: true, ..
             }) => true,
-            Self::Act(_) | Self::Check(_) | Self::Watch(_) | Self::Lease(_) | Self::Txn(_) => false,
+            Self::Act(_)
+            | Self::Check(_)
+            | Self::Watch(_)
+            | Self::Lease(_)
+            | Self::Txn(_)
+            | Self::Auth(_) => false,
         }
     }
 }
@@ -292,6 +301,8 @@ fn plan_op(step: Step, request: &Request, instance: &Instance) -> Result<Op, Ste
         lease::plan(step, request).map(Op::Lease)
     } else if step.is_txn() {
         txn::plan(step, request).map(Op::Txn)
+    } else if step.is_auth() {
+        auth::plan(step, request).map(Op::Auth)
     } else if step.is_expect() {
         expect::plan(step, request).map(Op::Expect)
     } else if step.is_node() {
@@ -312,6 +323,7 @@ fn record_for(op: &Op, instance: &str) -> Record {
         Op::Watch(watch) => watch::record_for(watch, instance),
         Op::Lease(lease) => lease::record_for(lease, instance),
         Op::Txn(txn) => txn::record_for(txn, instance),
+        Op::Auth(auth) => auth::record_for(auth, instance),
     }
 }
 
@@ -469,8 +481,8 @@ async fn perform(
             .map(|()| Vars::new()),
         Op::Node(node) => node::perform(client, tls, node, record).await,
         Op::Expect(expect) => expect::perform(client, tls, expect, record).await,
-        Op::Watch(_) | Op::Lease(_) | Op::Txn(_) => Err(StepError::input(
-            "a watch, lease or transaction step never runs on a client of its own",
+        Op::Watch(_) | Op::Lease(_) | Op::Txn(_) | Op::Auth(_) => Err(StepError::input(
+            "a watch, lease, transaction or login step never runs on a client of its own",
         )),
     }
 }
@@ -506,9 +518,16 @@ pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
         if let Op::Txn(Txn::Outcome(wanted)) = &op {
             return txn::outcome(instance, *wanted);
         }
+        // A login builds the client it needs, as the credentials it names.
+        if let Op::Auth(auth) = &op {
+            return tokio::time::timeout(limit, auth::perform(instance, auth, &mut record))
+                .await
+                .map_err(|_| no_response())?;
+        }
         let client = tokio::time::timeout(limit, instance.client(!op.local()))
             .await
             .map_err(|_| no_response())??;
+        let client = &client;
         let tls = instance.config.tls;
         if let Op::Lease(lease) = &op {
             return tokio::time::timeout(

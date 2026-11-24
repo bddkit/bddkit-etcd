@@ -566,7 +566,9 @@ pub fn plan(step: Step, request: &Request) -> Result<Watch, StepError> {
         | Step::TxnCommit
         | Step::TxnSucceeded
         | Step::TxnFailed
-        | Step::TxnRefuse => return Err(StepError::input("not a watch step")),
+        | Step::TxnRefuse
+        | Step::Authenticate
+        | Step::RefuseAuth => return Err(StepError::input("not a watch step")),
     })
 }
 

@@ -5,6 +5,7 @@
 
 use serde_json::{Value, json};
 
+use crate::auth;
 use crate::check;
 use crate::expect;
 use crate::lease;
@@ -74,10 +75,12 @@ pub enum Step {
     GetAtRevision,
     Compact,
     RefuseReadAt,
+    Authenticate,
+    RefuseAuth,
 }
 
 /// In the order the host indexes them.
-const ALL: [Step; 58] = [
+const ALL: [Step; 60] = [
     Step::Put,
     Step::PutDocString,
     Step::Get,
@@ -136,6 +139,8 @@ const ALL: [Step; 58] = [
     Step::GetAtRevision,
     Step::Compact,
     Step::RefuseReadAt,
+    Step::Authenticate,
+    Step::RefuseAuth,
 ];
 
 struct Spec {
@@ -190,7 +195,8 @@ impl Step {
             | Self::PutLeased
             | Self::TxnCommit
             | Self::GetAtRevision
-            | Self::Compact => false,
+            | Self::Compact
+            | Self::Authenticate => false,
             Self::Exists
             | Self::Absent
             | Self::HasValue
@@ -227,8 +233,14 @@ impl Step {
             | Self::TxnSucceeded
             | Self::TxnFailed
             | Self::TxnRefuse
-            | Self::RefuseReadAt => true,
+            | Self::RefuseReadAt
+            | Self::RefuseAuth => true,
         }
+    }
+
+    /// The steps about logging in as another user, see `auth.rs`.
+    pub fn is_auth(self) -> bool {
+        matches!(self, Self::Authenticate | Self::RefuseAuth)
     }
 
     /// The steps about one node of a cluster, see `node.rs`.
@@ -401,6 +413,7 @@ impl Step {
             Self::TxnCommit | Self::TxnSucceeded | Self::TxnFailed | Self::TxnRefuse => {
                 self.txn_spec()
             }
+            Self::Authenticate | Self::RefuseAuth => self.auth_spec(),
         };
         Spec {
             expression,
@@ -671,6 +684,23 @@ impl Step {
         }
     }
 
+    /// The login steps, kept apart so `spec` stays short.
+    fn auth_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
+        match self {
+            Self::Authenticate => (
+                r#"I authenticate to etcd as "{user}" with password "{password:secret}""#,
+                "logs in as another user until the scenario ends: connects at once, and every later step of the instance goes through the new credentials; a refused password fails this step; watches and leases opened before keep the client they were opened with; the next scenario is back to the configured user",
+                NONE,
+            ),
+            Self::RefuseAuth => (
+                r#"etcd should refuse authentication as "{user}" with password "{password:secret}" with "{code}""#,
+                "tries to log in again on every attempt and passes once the server refuses it with this gRPC code (a name as tonic spells it: InvalidArgument for etcd, Unauthenticated for some compatible servers); a failure on the client side is never a refusal; changes nothing for the steps that follow",
+                NONE,
+            ),
+            _ => unreachable!("not a login step"),
+        }
+    }
+
     /// The steps of the cluster, kept apart so `spec` stays short.
     fn cluster_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
         match self {
@@ -781,6 +811,11 @@ pub fn validate(index: u32, request: &str) -> String {
         if let Err(error) = checked {
             return reply::err(error, &[]);
         }
+    } else if step.is_auth() {
+        let checked = Request::parse(&request.to_string()).and_then(|r| auth::validate(step, &r));
+        if let Err(error) = checked {
+            return reply::err(error, &[]);
+        }
     } else if step.is_assertion() {
         let checked =
             Request::parse(&request.to_string()).and_then(|parsed| check::validate(step, &parsed));
@@ -823,7 +858,7 @@ mod tests {
             let found = Step::from_index(u32::try_from(index).expect("small")).expect("step");
             assert!(found == *step);
         }
-        assert!(Step::from_index(58).is_none());
+        assert!(Step::from_index(60).is_none());
     }
 
     #[test]
