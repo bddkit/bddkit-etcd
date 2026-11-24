@@ -143,6 +143,9 @@ pub fn plan(step: Step, request: &Request) -> Result<Lease, StepError> {
         | Step::RefuseRead
         | Step::RefuseReadSerializable
         | Step::RefuseCompact
+        | Step::GetAtRevision
+        | Step::Compact
+        | Step::RefuseReadAt
         | Step::WatchKey
         | Step::WatchPrefix
         | Step::WatchKeyFrom

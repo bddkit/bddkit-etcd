@@ -71,10 +71,13 @@ pub enum Step {
     TxnSucceeded,
     TxnFailed,
     TxnRefuse,
+    GetAtRevision,
+    Compact,
+    RefuseReadAt,
 }
 
 /// In the order the host indexes them.
-const ALL: [Step; 55] = [
+const ALL: [Step; 58] = [
     Step::Put,
     Step::PutDocString,
     Step::Get,
@@ -130,6 +133,9 @@ const ALL: [Step; 55] = [
     Step::TxnSucceeded,
     Step::TxnFailed,
     Step::TxnRefuse,
+    Step::GetAtRevision,
+    Step::Compact,
+    Step::RefuseReadAt,
 ];
 
 struct Spec {
@@ -182,7 +188,9 @@ impl Step {
             | Self::LeaseStop
             | Self::LeaseRevoke
             | Self::PutLeased
-            | Self::TxnCommit => false,
+            | Self::TxnCommit
+            | Self::GetAtRevision
+            | Self::Compact => false,
             Self::Exists
             | Self::Absent
             | Self::HasValue
@@ -218,7 +226,8 @@ impl Step {
             | Self::LeaseHolds
             | Self::TxnSucceeded
             | Self::TxnFailed
-            | Self::TxnRefuse => true,
+            | Self::TxnRefuse
+            | Self::RefuseReadAt => true,
         }
     }
 
@@ -241,6 +250,7 @@ impl Step {
                 | Self::RefuseRead
                 | Self::RefuseReadSerializable
                 | Self::RefuseCompact
+                | Self::RefuseReadAt
         )
     }
 
@@ -309,7 +319,9 @@ impl Step {
             | Self::Get
             | Self::DeleteKey
             | Self::DeletePrefix
-            | Self::DeleteAll => self.action_spec(),
+            | Self::DeleteAll
+            | Self::GetAtRevision
+            | Self::Compact => self.action_spec(),
             Self::Exists => (
                 r#"etcd key "{key}" should exist"#,
                 "reads the key again on every attempt; passes when it exists",
@@ -363,7 +375,8 @@ impl Step {
             | Self::AcceptReadSerializable
             | Self::RefuseRead
             | Self::RefuseReadSerializable
-            | Self::RefuseCompact => self.expect_spec(),
+            | Self::RefuseCompact
+            | Self::RefuseReadAt => self.expect_spec(),
             Self::WatchKey
             | Self::WatchPrefix
             | Self::WatchKeyFrom
@@ -429,6 +442,16 @@ impl Step {
                 "clears the whole server, with no awareness of files running in parallel",
                 DELETED,
             ),
+            Self::GetAtRevision => (
+                r#"I get etcd key "{key}" at revision {rev:uint}"#,
+                "reads a key as it was at this revision (linearizable), into the variables of I get (etcd_revision is the server's revision when it answered, the revision of the value is etcd_mod_revision); fails when the key did not exist then, and when the server refuses the revision (compacted or not reached yet: OutOfRange); revision 0 is refused, the server would read the latest",
+                READ,
+            ),
+            Self::Compact => (
+                "I compact etcd up to revision {rev:uint}",
+                "compacts the server's history up to the revision, so an older revision can no longer be read, and stores the revision of the response in etcd_revision; not physical (no waiting for the backend); a revision already compacted or not reached yet fails as OutOfRange; it acts on every file that uses the server, so keep such files in a @serial chain",
+                REVISION,
+            ),
             _ => unreachable!("not an action on keys"),
         }
     }
@@ -491,6 +514,11 @@ impl Step {
             Self::RefuseCompact => (
                 "etcd should refuse a compaction up to revision {rev:uint} with \"{code}\"",
                 "compacts up to the revision again on every attempt and passes once the server refuses it with this gRPC code (a name as tonic spells it: PermissionDenied, Unavailable, ...); a compaction the server accepts really compacts, so keep such files in a @serial chain",
+                NONE,
+            ),
+            Self::RefuseReadAt => (
+                r#"etcd should refuse a read of key "{key}" at revision {rev:uint} with "{code}""#,
+                "reads the key at the revision (linearizable) again on every attempt and passes once the server refuses it with this gRPC code (a name as tonic spells it: OutOfRange for a compacted or a future revision, ...); a failure on the client side is never a refusal; revision 0 is refused",
                 NONE,
             ),
             _ => unreachable!("not an accept / refuse step"),
@@ -715,6 +743,19 @@ pub fn validate(index: u32, request: &str) -> String {
     if step == Step::DeletePrefix && request["args"][0] == "" {
         return reply::err(EMPTY_PREFIX, &[]);
     }
+    if matches!(step, Step::GetAtRevision | Step::Compact) {
+        // A compaction leaves the verdict on any revision to the server.
+        let (at, parse): (_, fn(&str) -> _) = if step == Step::Compact {
+            (0, crate::node::revision)
+        } else {
+            (1, crate::ops::read_revision)
+        };
+        let checked = Request::parse(&request.to_string())
+            .and_then(|r| crate::ops::literal_revision(r.args.get(at), parse));
+        if let Err(error) = checked {
+            return reply::err(error, &[]);
+        }
+    }
     if step.is_expect() {
         let checked = Request::parse(&request.to_string()).and_then(|r| expect::validate(step, &r));
         if let Err(error) = checked {
@@ -782,7 +823,30 @@ mod tests {
             let found = Step::from_index(u32::try_from(index).expect("small")).expect("step");
             assert!(found == *step);
         }
-        assert!(Step::from_index(55).is_none());
+        assert!(Step::from_index(58).is_none());
+    }
+
+    #[test]
+    fn a_literal_revision_that_cannot_be_read_is_refused_before_the_first_request() {
+        let check = |index, args: Value| -> Value {
+            serde_json::from_str(&validate(index, &json!({"args": args}).to_string()))
+                .expect("JSON")
+        };
+        let (get_at, compact, refuse_at) = (55, 56, 57);
+        assert_eq!(check(get_at, json!(["/k", "0"]))["ok"], false);
+        assert_eq!(check(get_at, json!(["/k", "<<r>>"]))["ok"], true);
+        assert_eq!(check(get_at, json!(["/k", "5"]))["ok"], true);
+        assert_eq!(
+            check(refuse_at, json!(["/k", "0", "OutOfRange"]))["ok"],
+            false
+        );
+        assert_eq!(
+            check(refuse_at, json!(["/k", "5", "OutOfRange"]))["ok"],
+            true
+        );
+        assert_eq!(check(compact, json!(["99999999999999999999"]))["ok"], false);
+        assert_eq!(check(compact, json!(["<<r>>"]))["ok"], true);
+        assert_eq!(check(compact, json!(["0"]))["ok"], true);
     }
 
     #[test]
