@@ -153,6 +153,10 @@ pub fn plan(step: Step, request: &Request) -> Result<Lease, StepError> {
         | Step::WatchedCount
         | Step::WatchedEvents
         | Step::WatchResumed
+        | Step::TxnCommit
+        | Step::TxnSucceeded
+        | Step::TxnFailed
+        | Step::TxnRefuse
         | Step::WatchResumedTimes => return Err(StepError::input("not a lease step")),
     })
 }

@@ -32,7 +32,7 @@ enum Call {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Wanted {
+pub(crate) enum Wanted {
     Accept,
     Refuse(Code),
 }
@@ -74,7 +74,7 @@ fn valid_codes() -> impl Iterator<Item = Code> {
     (1..=16).map(Code::from_i32)
 }
 
-fn code(name: &str) -> Result<Code, String> {
+pub(crate) fn code(name: &str) -> Result<Code, String> {
     valid_codes()
         .find(|code| format!("{code:?}") == name)
         .ok_or_else(|| {
@@ -167,6 +167,10 @@ pub fn plan(step: Step, request: &Request) -> Result<Expect, StepError> {
         | Step::LeaseAliveId
         | Step::LeaseExpiredId
         | Step::LeaseHolds
+        | Step::TxnCommit
+        | Step::TxnSucceeded
+        | Step::TxnFailed
+        | Step::TxnRefuse
         | Step::WatchResumedTimes => return Err(StepError::input("not an accept / refuse step")),
     };
     Ok(Expect { call, wanted })
@@ -213,11 +217,32 @@ pub fn record_for(expect: &Expect, instance: &str) -> Record {
 /// `not_yet`: a node comes back, a quorum is restored, a compaction is
 /// refused until the revision exists.
 fn judge(expect: &Expect, outcome: Result<(), &Error>, tls: bool) -> Result<(), StepError> {
-    let what = expect.what();
+    judge_what(&expect.what(), &expect.wanted, outcome, tls)
+}
+
+/// What the server said when it refused: kept in the evidence. A failure on
+/// the client side said nothing.
+pub(crate) fn note_refusal(record: &mut Record, error: &Error) {
+    if let Error::GRpcStatus(status) = error
+        && class_of(error) == Class::DbStatement
+    {
+        record
+            .keys
+            .push(json!({"refused": format!("{:?}", status.code()), "message": status.message()}));
+    }
+}
+
+/// The same verdict for any operation, named by `what`.
+pub(crate) fn judge_what(
+    what: &str,
+    wanted: &Wanted,
+    outcome: Result<(), &Error>,
+    tls: bool,
+) -> Result<(), StepError> {
     let miss = |message: String| StepError::not_yet(Class::Assertion, message);
     let status = match outcome {
         Ok(()) => {
-            return match &expect.wanted {
+            return match wanted {
                 Wanted::Accept => Ok(()),
                 Wanted::Refuse(want) => Err(miss(format!(
                     "the server accepted {what}, expected a refusal with {want:?}"
@@ -232,7 +257,7 @@ fn judge(expect: &Expect, outcome: Result<(), &Error>, tls: bool) -> Result<(), 
         }
     };
     let got = status.code();
-    match &expect.wanted {
+    match wanted {
         Wanted::Refuse(want) if *want == got => Ok(()),
         Wanted::Refuse(want) => Err(miss(format!(
             "the server refused {what} with {got:?}, expected {want:?}: {}",
@@ -268,10 +293,7 @@ pub async fn perform(
     };
     match &answer {
         Ok(header) => record.answered(header.as_ref()),
-        Err(error @ Error::GRpcStatus(status)) if class_of(error) == Class::DbStatement => record
-            .keys
-            .push(json!({"refused": format!("{:?}", status.code()), "message": status.message()})),
-        Err(_) => {}
+        Err(error) => note_refusal(record, error),
     }
     judge(expect, answer.as_ref().map(drop), tls).map(|()| Vars::new())
 }

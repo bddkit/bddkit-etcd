@@ -157,6 +157,26 @@ fn a_literal_empty_prefix_stops_the_run_before_the_first_request() {
 }
 
 #[test]
+fn a_transaction_with_an_unknown_flag_stops_the_run_naming_its_line() {
+    let bin = require_bddkit!();
+    let cfg = keys_project(
+        "txn-flag",
+        r#"    When I commit an etcd transaction:
+      """
+      create("/k") = "0"
+
+      put /k v --nope
+      """
+"#,
+    );
+    let out = bddkit(&bin, &["run", "--config", path(&cfg)]);
+    let text = combined(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("line 3:"), "{text}");
+    assert!(text.contains("unknown flag"), "{text}");
+}
+
+#[test]
 fn an_empty_prefix_from_a_variable_fails_the_step_and_deletes_nothing() {
     let bin = require_bddkit!();
     let cfg = keys_project(

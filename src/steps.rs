@@ -11,6 +11,7 @@ use crate::lease;
 use crate::node;
 use crate::ops::Request;
 use crate::reply;
+use crate::txn;
 use crate::watch;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,10 +67,14 @@ pub enum Step {
     LeaseAliveId,
     LeaseExpiredId,
     LeaseHolds,
+    TxnCommit,
+    TxnSucceeded,
+    TxnFailed,
+    TxnRefuse,
 }
 
 /// In the order the host indexes them.
-const ALL: [Step; 51] = [
+const ALL: [Step; 55] = [
     Step::Put,
     Step::PutDocString,
     Step::Get,
@@ -121,6 +126,10 @@ const ALL: [Step; 51] = [
     Step::LeaseAliveId,
     Step::LeaseExpiredId,
     Step::LeaseHolds,
+    Step::TxnCommit,
+    Step::TxnSucceeded,
+    Step::TxnFailed,
+    Step::TxnRefuse,
 ];
 
 struct Spec {
@@ -136,6 +145,7 @@ const REVISION: &[&str] = &["etcd_revision"];
 const DELETED: &[&str] = &["etcd_revision", "etcd_deleted"];
 const HASH: &[&str] = &["{name}"];
 const LEASE: &[&str] = &["etcd_lease_{name}"];
+const TXN: &[&str] = &["etcd_txn_succeeded", "etcd_revision"];
 const WATCH: &[&str] = &["etcd_watch_{name}_revision"];
 const READ: &[&str] = &[
     "etcd_value",
@@ -171,7 +181,8 @@ impl Step {
             | Self::LeaseKeep
             | Self::LeaseStop
             | Self::LeaseRevoke
-            | Self::PutLeased => false,
+            | Self::PutLeased
+            | Self::TxnCommit => false,
             Self::Exists
             | Self::Absent
             | Self::HasValue
@@ -204,7 +215,10 @@ impl Step {
             | Self::LeaseExpired
             | Self::LeaseAliveId
             | Self::LeaseExpiredId
-            | Self::LeaseHolds => true,
+            | Self::LeaseHolds
+            | Self::TxnSucceeded
+            | Self::TxnFailed
+            | Self::TxnRefuse => true,
         }
     }
 
@@ -262,6 +276,14 @@ impl Step {
                 | Self::LeaseAliveId
                 | Self::LeaseExpiredId
                 | Self::LeaseHolds
+        )
+    }
+
+    /// The steps about transactions, see `txn.rs`.
+    pub fn is_txn(self) -> bool {
+        matches!(
+            self,
+            Self::TxnCommit | Self::TxnSucceeded | Self::TxnFailed | Self::TxnRefuse
         )
     }
 
@@ -363,6 +385,9 @@ impl Step {
             | Self::LeaseAliveId
             | Self::LeaseExpiredId
             | Self::LeaseHolds => self.lease_spec(),
+            Self::TxnCommit | Self::TxnSucceeded | Self::TxnFailed | Self::TxnRefuse => {
+                self.txn_spec()
+            }
         };
         Spec {
             expression,
@@ -591,6 +616,33 @@ impl Step {
         }
     }
 
+    /// The transaction steps, kept apart so `spec` stays short.
+    fn txn_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
+        match self {
+            Self::TxnCommit => (
+                "I commit an etcd transaction:",
+                "commits the doc string, written as `etcdctl txn` reads it (compares, an empty line, the operations on success, an empty line, the operations on failure), and stores whether the compares held in etcd_txn_succeeded (true or false) and the revision in etcd_revision; compares that do not hold are not a failure; what the operations returned is in the evidence; a <<slot>> is replaced before the text is read, so its value becomes text of the transaction: put the slot in double quotes, and a value that holds a double quote, a backslash or a line break breaks the syntax",
+                TXN,
+            ),
+            Self::TxnSucceeded => (
+                "the etcd transaction should have succeeded",
+                "passes when the compares of the last transaction of the scenario on this instance held; reads what that step kept, sends no request",
+                NONE,
+            ),
+            Self::TxnFailed => (
+                "the etcd transaction should have failed",
+                "passes when the compares of the last transaction of the scenario on this instance did not hold; reads what that step kept, sends no request",
+                NONE,
+            ),
+            Self::TxnRefuse => (
+                r#"etcd should refuse a transaction with "{code}":"#,
+                "commits the doc string again on every attempt and passes once the server refuses it with this gRPC code (a name as tonic spells it: PermissionDenied, InvalidArgument, ...); a failure on the client side is never a refusal, and a transaction the server accepts really applies",
+                NONE,
+            ),
+            _ => unreachable!("not a transaction step"),
+        }
+    }
+
     /// The steps of the cluster, kept apart so `spec` stays short.
     fn cluster_spec(self) -> (&'static str, &'static str, &'static [&'static str]) {
         match self {
@@ -683,6 +735,11 @@ pub fn validate(index: u32, request: &str) -> String {
         if let Err(error) = checked {
             return reply::err(error, &[]);
         }
+    } else if step.is_txn() {
+        let checked = Request::parse(&request.to_string()).and_then(|r| txn::validate(step, &r));
+        if let Err(error) = checked {
+            return reply::err(error, &[]);
+        }
     } else if step.is_assertion() {
         let checked =
             Request::parse(&request.to_string()).and_then(|parsed| check::validate(step, &parsed));
@@ -725,7 +782,7 @@ mod tests {
             let found = Step::from_index(u32::try_from(index).expect("small")).expect("step");
             assert!(found == *step);
         }
-        assert!(Step::from_index(51).is_none());
+        assert!(Step::from_index(55).is_none());
     }
 
     #[test]
