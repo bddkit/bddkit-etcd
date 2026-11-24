@@ -9,6 +9,7 @@ use etcd_client::{Client, DeleteOptions, GetOptions, ResponseHeader};
 use serde_json::{Value, json};
 
 use crate::auth::{self, Auth};
+use crate::check::is_slot;
 use crate::check::{self, Check};
 use crate::client::request_failure;
 use crate::error::{Class, StepError};
@@ -16,7 +17,7 @@ use crate::evidence::{Record, base64, shown};
 use crate::expect::{self, Expect};
 use crate::instance::{Instance, Last};
 use crate::lease::{self, Lease};
-use crate::node::{self, Node};
+use crate::node::{self, Node, revision};
 use crate::reply;
 use crate::steps::{EMPTY_PREFIX, Step};
 use crate::txn::{self, Txn};
@@ -97,8 +98,16 @@ enum Range {
 
 #[derive(Debug)]
 enum Action {
-    Put { key: String, value: String },
-    Get { key: String, serializable: bool },
+    Put {
+        key: String,
+        value: String,
+    },
+    Get {
+        key: String,
+        serializable: bool,
+        revision: Option<i64>,
+    },
+    Compact(i64),
     Delete(Range),
 }
 
@@ -108,6 +117,61 @@ enum Action {
 pub fn doc_value(docstring: &str) -> &str {
     let text = docstring.strip_prefix('\n').unwrap_or(docstring);
     text.strip_suffix('\n').unwrap_or(text)
+}
+
+/// The revision of a read: 0 would mean "the latest" to the server, which is
+/// never what a step that names a revision wants.
+pub(crate) fn read_revision(text: &str) -> Result<i64, StepError> {
+    match revision(text)? {
+        0 => Err(StepError::input(
+            "revision 0 is the latest revision to the server; name the revision to read",
+        )),
+        rev => Ok(rev),
+    }
+}
+
+/// `bddkit_validate_step`: a revision that is a literal is checked before the
+/// first request; one that holds a `<<slot>>` is left to the step.
+pub(crate) fn literal_revision(
+    text: Option<&String>,
+    parse: fn(&str) -> Result<i64, StepError>,
+) -> Result<(), String> {
+    match text {
+        Some(text) if !is_slot(text) => parse(text).map(drop).map_err(|e| e.message),
+        _ => Ok(()),
+    }
+}
+
+/// The options of a read, shared with the accept / refuse steps.
+pub(crate) fn read_options(serializable: bool, revision: Option<i64>) -> GetOptions {
+    let mut options = GetOptions::new();
+    if serializable {
+        options = options.with_serializable();
+    }
+    if let Some(rev) = revision {
+        options = options.with_revision(rev);
+    }
+    options
+}
+
+/// The evidence of a compaction.
+pub(crate) fn compact_record(rev: i64, instance: &str) -> Record {
+    Record::new(
+        "Compact",
+        &format!("revision {rev}"),
+        instance,
+        json!({"revision": rev}),
+    )
+}
+
+/// The request of a read as the evidence shows it: the revision only when
+/// the step names one.
+pub(crate) fn read_details(key: &str, serializable: bool, revision: Option<i64>) -> Value {
+    let mut details = json!({"key": key, "serializable": serializable});
+    if let Some(rev) = revision {
+        details["revision"] = json!(rev);
+    }
+    details
 }
 
 /// Everything that can be refused without a request, refused here.
@@ -125,7 +189,14 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
         Step::Get | Step::GetSerializable => Action::Get {
             key: key()?,
             serializable: step == Step::GetSerializable,
+            revision: None,
         },
+        Step::GetAtRevision => Action::Get {
+            key: key()?,
+            serializable: false,
+            revision: Some(read_revision(request.arg(1)?)?),
+        },
+        Step::Compact => Action::Compact(revision(request.arg(0)?)?),
         Step::DeleteKey => Action::Delete(Range::Key(key()?)),
         // An empty value that came through a variable: a literal one never
         // gets here, `validate` stops it.
@@ -157,6 +228,7 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
         | Step::RefuseRead
         | Step::RefuseReadSerializable
         | Step::RefuseCompact
+        | Step::RefuseReadAt
         | Step::WatchKey
         | Step::WatchPrefix
         | Step::WatchKeyFrom
@@ -262,12 +334,17 @@ fn record_for_action(action: &Action, instance: &str) -> Record {
             record.scan_text(value);
             record
         }
-        Action::Get { key, serializable } => Record::new(
+        Action::Get {
+            key,
+            serializable,
+            revision,
+        } => Record::new(
             "Get",
             key,
             instance,
-            json!({"key": key, "serializable": serializable}),
+            read_details(key, *serializable, *revision),
         ),
+        Action::Compact(rev) => compact_record(*rev, instance),
         Action::Delete(Range::Key(key)) => {
             Record::new("Delete", key, instance, json!({"key": key}))
         }
@@ -317,18 +394,33 @@ async fn perform_action(
             record.answered(response.header());
             Ok(revision_vars(header(response.header())?))
         }
-        Action::Get { key, serializable } => {
-            let options = serializable.then(|| GetOptions::new().with_serializable());
+        Action::Compact(rev) => {
             let response = kv
-                .get(key.as_str(), options)
+                .compact(*rev, None)
                 .await
                 .map_err(|e| request_failure(&e, tls))?;
             record.answered(response.header());
-            let revision = header(response.header())?;
+            Ok(revision_vars(header(response.header())?))
+        }
+        Action::Get {
+            key,
+            serializable,
+            revision,
+        } => {
+            let options = read_options(*serializable, *revision);
+            let response = kv
+                .get(key.as_str(), Some(options))
+                .await
+                .map_err(|e| request_failure(&e, tls))?;
+            record.answered(response.header());
+            let answered = header(response.header())?;
             let Some(item) = response.kvs().first() else {
-                return Err(StepError::assertion(format!(
-                    "etcd key \"{key}\" does not exist; to check that a key is absent, use: etcd key \"{key}\" should not exist"
-                )));
+                return Err(StepError::assertion(match revision {
+                    Some(rev) => format!("etcd key \"{key}\" did not exist at revision {rev}"),
+                    None => format!(
+                        "etcd key \"{key}\" does not exist; to check that a key is absent, use: etcd key \"{key}\" should not exist"
+                    ),
+                }));
             };
             record.keys.push(json!({
                 "key": shown(item.key()),
@@ -344,7 +436,7 @@ async fn perform_action(
                 )));
             };
             record.scan_text(text);
-            let mut vars = revision_vars(revision);
+            let mut vars = revision_vars(answered);
             vars.insert("etcd_value".to_string(), text.to_string());
             for (name, number) in [
                 ("etcd_create_revision", item.create_revision()),

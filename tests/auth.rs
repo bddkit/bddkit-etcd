@@ -30,8 +30,8 @@ const REFUSE_PUT: u32 = 24;
 const REFUSE_READ_SERIALIZABLE: u32 = 28;
 const WATCH_KEY: u32 = 30;
 const WATCHED_PUT: u32 = 35;
-const AUTHENTICATE: u32 = 55;
-const REFUSE_AUTH: u32 = 56;
+const AUTHENTICATE: u32 = 58;
+const REFUSE_AUTH: u32 = 59;
 
 const READER: &str = "bddkit-reader";
 const READER_PASSWORD: &str = "reader-pw-9d2b41";

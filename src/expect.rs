@@ -5,7 +5,7 @@
 //! (connect, transport, timeout) is `db_connection`, so that a node that was
 //! simply killed never satisfies a refusal with `Unavailable`.
 
-use etcd_client::{Client, Error, GetOptions};
+use etcd_client::{Client, Error};
 use serde_json::json;
 use tonic::Code;
 
@@ -14,7 +14,9 @@ use crate::client::{class_of, request_failure};
 use crate::error::{Class, StepError};
 use crate::evidence::Record;
 use crate::node::revision;
-use crate::ops::{Request, Vars};
+use crate::ops::{
+    Request, Vars, compact_record, literal_revision, read_details, read_options, read_revision,
+};
 use crate::steps::Step;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -27,6 +29,7 @@ enum Call {
     Read {
         key: String,
         serializable: bool,
+        revision: Option<i64>,
     },
     Compact(i64),
 }
@@ -60,9 +63,14 @@ impl Expect {
     fn what(&self) -> String {
         match &self.call {
             Call::Put { key, .. } => format!("a put of etcd key \"{key}\""),
-            Call::Read { key, serializable } => format!(
-                "a {}read of etcd key \"{key}\"",
-                if *serializable { "serializable " } else { "" }
+            Call::Read {
+                key,
+                serializable,
+                revision,
+            } => format!(
+                "a {}read of etcd key \"{key}\"{}",
+                if *serializable { "serializable " } else { "" },
+                revision.map_or_else(String::new, |rev| format!(" at revision {rev}"))
             ),
             Call::Compact(rev) => format!("a compaction up to revision {rev}"),
         }
@@ -113,6 +121,7 @@ pub fn plan(step: Step, request: &Request) -> Result<Expect, StepError> {
             Call::Read {
                 key: key()?,
                 serializable: step == Step::AcceptReadSerializable,
+                revision: None,
             },
             Wanted::Accept,
         ),
@@ -120,8 +129,17 @@ pub fn plan(step: Step, request: &Request) -> Result<Expect, StepError> {
             Call::Read {
                 key: key()?,
                 serializable: step == Step::RefuseReadSerializable,
+                revision: None,
             },
             refuse(1)?,
+        ),
+        Step::RefuseReadAt => (
+            Call::Read {
+                key: key()?,
+                serializable: false,
+                revision: Some(read_revision(request.arg(1)?)?),
+            },
+            refuse(2)?,
         ),
         Step::RefuseCompact => (Call::Compact(revision(request.arg(0)?)?), refuse(1)?),
         Step::Put
@@ -170,6 +188,8 @@ pub fn plan(step: Step, request: &Request) -> Result<Expect, StepError> {
         | Step::TxnCommit
         | Step::TxnSucceeded
         | Step::TxnFailed
+        | Step::GetAtRevision
+        | Step::Compact
         | Step::TxnRefuse
         | Step::Authenticate
         | Step::RefuseAuth
@@ -186,8 +206,11 @@ pub fn validate(step: Step, request: &Request) -> Result<(), String> {
     ) {
         return Ok(());
     }
-    // The code is the second argument of every refusal.
-    match request.args.get(1) {
+    if step == Step::RefuseReadAt {
+        literal_revision(request.args.get(1), read_revision)?;
+    }
+    // The code is the last argument of every refusal.
+    match request.args.last() {
         Some(name) if !is_slot(name) => code(name).map(drop),
         _ => Ok(()),
     }
@@ -200,18 +223,17 @@ pub fn record_for(expect: &Expect, instance: &str) -> Record {
             record.scan_text(value);
             record
         }
-        Call::Read { key, serializable } => Record::new(
+        Call::Read {
+            key,
+            serializable,
+            revision,
+        } => Record::new(
             "Get",
             key,
             instance,
-            json!({"key": key, "serializable": serializable}),
+            read_details(key, *serializable, *revision),
         ),
-        Call::Compact(rev) => Record::new(
-            "Compact",
-            &format!("revision {rev}"),
-            instance,
-            json!({"revision": rev}),
-        ),
+        Call::Compact(rev) => compact_record(*rev, instance),
     }
 }
 
@@ -285,12 +307,14 @@ pub async fn perform(
             .put(key.as_str(), value.as_str(), None)
             .await
             .map(|r| r.header().cloned()),
-        Call::Read { key, serializable } => {
-            let options = serializable.then(|| GetOptions::new().with_serializable());
-            kv.get(key.as_str(), options)
-                .await
-                .map(|r| r.header().cloned())
-        }
+        Call::Read {
+            key,
+            serializable,
+            revision,
+        } => kv
+            .get(key.as_str(), Some(read_options(*serializable, *revision)))
+            .await
+            .map(|r| r.header().cloned()),
         Call::Compact(rev) => kv.compact(*rev, None).await.map(|r| r.header().cloned()),
     };
     match &answer {
@@ -415,5 +439,16 @@ mod tests {
         let accept = expect(Step::AcceptPut, &["/k", "s3cret-value"]);
         let error = judge(&accept, Err(&from_server(Code::Unavailable)), false).expect_err("x");
         assert!(!error.message.contains("s3cret-value"), "{error}");
+    }
+
+    #[test]
+    fn a_read_at_a_revision_names_it_and_refuses_revision_zero_and_a_bad_code() {
+        let wanted = expect(Step::RefuseReadAt, &["/k", "5", "OutOfRange"]);
+        assert!(!wanted.local());
+        assert_eq!(wanted.what(), "a read of etcd key \"/k\" at revision 5");
+        let refused = plan(Step::RefuseReadAt, &request(&["/k", "0", "OutOfRange"]));
+        assert_eq!(refused.expect_err("refused").class, Class::Input);
+        assert!(validate(Step::RefuseReadAt, &request(&["/k", "5", "bogus"])).is_err());
+        assert!(validate(Step::RefuseReadAt, &request(&["/k", "5", "OutOfRange"])).is_ok());
     }
 }
