@@ -22,3 +22,7 @@ resources:
       endpoints: http://127.0.0.1:25002
     n3:
       endpoints: http://127.0.0.1:25003
+    # Every endpoint: a lease kept alive through it moves to another node when
+    # one dies.
+    all:
+      endpoints: http://127.0.0.1:25001,http://127.0.0.1:25002,http://127.0.0.1:25003
