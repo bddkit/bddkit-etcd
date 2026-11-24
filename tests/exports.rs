@@ -27,11 +27,11 @@ fn the_manifest_and_the_step_list_are_what_the_host_loads() {
     assert_eq!(manifest["groups"], json!(["etcd"]));
     let steps = call(bddkit_list_steps());
     let steps = steps.as_array().expect("an array");
-    assert_eq!(steps.len(), 51);
+    assert_eq!(steps.len(), 55);
     assert!(steps.iter().all(|s| s["group"] == "etcd"));
     assert_eq!(
         steps.iter().filter(|s| s["kind"] == "assertion").count(),
-        33
+        36
     );
 }
 

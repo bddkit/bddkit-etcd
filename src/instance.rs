@@ -11,6 +11,7 @@ use crate::client;
 use crate::config::Config;
 use crate::error::StepError;
 use crate::lease::Leases;
+use crate::txn::Outcome;
 use crate::watch::Watches;
 
 /// The last operation as the failure dump shows it.
@@ -33,6 +34,8 @@ pub struct Instance {
     pub watches: Watches,
     /// The named leases of the scenario.
     pub leases: Leases,
+    /// Whether the compares of the last transaction of the scenario held.
+    pub txn: Outcome,
 }
 
 impl Instance {
@@ -44,6 +47,7 @@ impl Instance {
             last: Mutex::new(None),
             watches: Watches::default(),
             leases: Leases::default(),
+            txn: Outcome::default(),
         }
     }
 
@@ -82,6 +86,7 @@ impl Instance {
     /// there). The client stays, it is not scenario state.
     pub async fn reset(&self) {
         *self.last_slot() = None;
+        self.txn.forget();
         self.watches.stop_all().await;
         self.leases.reset(self.client.get()).await;
     }

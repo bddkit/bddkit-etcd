@@ -559,7 +559,11 @@ pub fn plan(step: Step, request: &Request) -> Result<Watch, StepError> {
         | Step::LeaseExpired
         | Step::LeaseAliveId
         | Step::LeaseExpiredId
-        | Step::LeaseHolds => return Err(StepError::input("not a watch step")),
+        | Step::LeaseHolds
+        | Step::TxnCommit
+        | Step::TxnSucceeded
+        | Step::TxnFailed
+        | Step::TxnRefuse => return Err(StepError::input("not a watch step")),
     })
 }
 

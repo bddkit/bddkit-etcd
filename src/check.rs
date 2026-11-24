@@ -285,6 +285,10 @@ pub fn plan(step: Step, request: &Request) -> Result<Check, StepError> {
         | Step::LeaseAliveId
         | Step::LeaseExpiredId
         | Step::LeaseHolds
+        | Step::TxnCommit
+        | Step::TxnSucceeded
+        | Step::TxnFailed
+        | Step::TxnRefuse
         | Step::WatchResumedTimes => Err(StepError::input("not an assertion")),
     }
 }

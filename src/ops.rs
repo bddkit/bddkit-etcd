@@ -18,6 +18,7 @@ use crate::lease::{self, Lease};
 use crate::node::{self, Node};
 use crate::reply;
 use crate::steps::{EMPTY_PREFIX, Step};
+use crate::txn::{self, Txn};
 use crate::watch::{self, Watch};
 
 /// What a step reads of the dispatch request.
@@ -175,6 +176,10 @@ fn plan(step: Step, request: &Request) -> Result<Action, StepError> {
         | Step::LeaseAliveId
         | Step::LeaseExpiredId
         | Step::LeaseHolds
+        | Step::TxnCommit
+        | Step::TxnSucceeded
+        | Step::TxnFailed
+        | Step::TxnRefuse
         | Step::WatchResumedTimes => return Err(StepError::input("not an action")),
     })
 }
@@ -188,6 +193,7 @@ enum Op {
     Expect(Expect),
     Watch(Watch),
     Lease(Lease),
+    Txn(Txn),
 }
 
 impl Op {
@@ -201,7 +207,7 @@ impl Op {
             | Self::Act(Action::Get {
                 serializable: true, ..
             }) => true,
-            Self::Act(_) | Self::Check(_) | Self::Watch(_) | Self::Lease(_) => false,
+            Self::Act(_) | Self::Check(_) | Self::Watch(_) | Self::Lease(_) | Self::Txn(_) => false,
         }
     }
 }
@@ -212,6 +218,8 @@ fn plan_op(step: Step, request: &Request, instance: &Instance) -> Result<Op, Ste
         watch::plan(step, request).map(Op::Watch)
     } else if step.is_lease() {
         lease::plan(step, request).map(Op::Lease)
+    } else if step.is_txn() {
+        txn::plan(step, request).map(Op::Txn)
     } else if step.is_expect() {
         expect::plan(step, request).map(Op::Expect)
     } else if step.is_node() {
@@ -231,6 +239,7 @@ fn record_for(op: &Op, instance: &str) -> Record {
         Op::Expect(expect) => expect::record_for(expect, instance),
         Op::Watch(watch) => watch::record_for(watch, instance),
         Op::Lease(lease) => lease::record_for(lease, instance),
+        Op::Txn(txn) => txn::record_for(txn, instance),
     }
 }
 
@@ -368,8 +377,8 @@ async fn perform(
             .map(|()| Vars::new()),
         Op::Node(node) => node::perform(client, tls, node, record).await,
         Op::Expect(expect) => expect::perform(client, tls, expect, record).await,
-        Op::Watch(_) | Op::Lease(_) => Err(StepError::input(
-            "a watch or lease step never runs on a client of its own",
+        Op::Watch(_) | Op::Lease(_) | Op::Txn(_) => Err(StepError::input(
+            "a watch, lease or transaction step never runs on a client of its own",
         )),
     }
 }
@@ -401,6 +410,10 @@ pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
         if let Op::Watch(op) = &op {
             return watch::perform(instance, op, &mut record).await;
         }
+        // The outcome of the last transaction needs no server.
+        if let Op::Txn(Txn::Outcome(wanted)) = &op {
+            return txn::outcome(instance, *wanted);
+        }
         let client = tokio::time::timeout(limit, instance.client(!op.local()))
             .await
             .map_err(|_| no_response())??;
@@ -412,6 +425,11 @@ pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
             )
             .await
             .map_err(|_| no_response())?;
+        }
+        if let Op::Txn(txn) = &op {
+            return tokio::time::timeout(limit, txn::perform(instance, client, txn, &mut record))
+                .await
+                .map_err(|_| no_response())?;
         }
         tokio::time::timeout(limit, perform(client, tls, &op, &mut record))
             .await
@@ -428,6 +446,14 @@ pub async fn run(instance: &Instance, step: Step, request: &Request) -> String {
         result
     };
     record.took(started.elapsed());
+    // The outcome of a transaction is read from the handle: its empty record
+    // must not replace the commit's evidence in the failure dump.
+    if matches!(op, Op::Txn(Txn::Outcome(_))) {
+        return match result {
+            Ok(vars) => reply::passed(&vars, &[], &[], &[]),
+            Err(error) => reply::failed(&error, &[], &[], &[]),
+        };
+    }
     let diagnostics = vec![record.diagnostic()];
     let output = if request.debug {
         vec![record.output()]
