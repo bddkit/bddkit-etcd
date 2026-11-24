@@ -1,0 +1,18 @@
+# One etcd that the exec plugin starts, with authentication switched on by
+# `etcdctl` in the feature, so it needs no compose server. It needs the exec
+# plugin (`bddkit plugin install exec`) and the `etcd` and `etcdctl` binaries
+# of an etcd release on PATH. The server listens on 127.0.0.1:25021 (clients)
+# and 25031 (peers). Run from the repository root:
+#   bddkit run --config examples/auth.yaml
+paths: [examples/auth]
+
+default_etcd: main
+
+resources:
+  etcd:
+    # The configured user is root. The client connects at the first step of the
+    # instance, so the server has its root user by then.
+    main:
+      endpoints: http://127.0.0.1:25021
+      username: root
+      password: root-example-5c1e

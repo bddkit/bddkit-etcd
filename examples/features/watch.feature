@@ -1,3 +1,4 @@
+@serial(etcd-compaction)
 Feature: Watch
   A watch is opened by name, keeps every event it receives until the scenario
   ends, and is asserted on while the writes happen. The assertions never

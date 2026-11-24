@@ -6,7 +6,7 @@
 //! `etcd-b` on 12379): the addresses are written in `examples/*.yaml`, as a
 //! reader would copy them. Without the servers they skip, except under `CI`.
 //! The failover example needs no server: it needs etcd binaries and the `exec`
-//! plugin, see its test.
+//! plugin, see `run_with_binaries`.
 
 #![allow(
     clippy::expect_used,
@@ -151,32 +151,63 @@ fn the_failing_suite_fails_each_scenario_with_its_class_and_text() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The failover example starts its own nodes, so it needs binaries and not
-/// servers: `etcd` and `etcdctl` (the directory of `BDDKIT_TEST_ETCD_BIN` or
-/// `PATH`) and the `exec` plugin (`BDDKIT_EXEC_PLUGIN`).
-#[test]
-fn the_failover_example_passes_on_three_real_nodes() {
-    let bin = require_bddkit!();
-    let etcd = require_etcd_bin!();
+/// The examples that start their own etcd need binaries and not servers:
+/// `etcd` and `etcdctl` (the directory of `BDDKIT_TEST_ETCD_BIN` or `PATH`) and
+/// the `exec` plugin (`BDDKIT_EXEC_PLUGIN`). Runs the config, returns the exit
+/// code and the console; `None` when a skip applies.
+fn run_with_binaries(
+    bin: &std::path::Path,
+    etcd: &std::path::Path,
+    config: &str,
+) -> Option<(Option<i32>, String)> {
     let Some(exec) = common::exec_plugin() else {
         assert!(
             std::env::var_os("CI").is_none(),
             "BDDKIT_EXEC_PLUGIN does not name the exec plugin, and CI must not skip"
         );
         eprintln!("SKIP: set BDDKIT_EXEC_PLUGIN to libbddkit_exec.so");
-        return;
+        return None;
     };
     let mut dirs = vec![etcd.parent().expect("a directory").to_path_buf()];
     dirs.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
-    let out = std::process::Command::new(&bin)
-        .args(["run", "--config", "examples/cluster.yaml", "--bddkit-dir"])
+    let out = std::process::Command::new(bin)
+        .args(["run", "--config", config, "--bddkit-dir"])
         .arg(common::lock_dir_with_exec(&exec))
         .env("PATH", std::env::join_paths(dirs).expect("a PATH"))
         .output()
         .expect("bddkit");
-    let text = combined(&out);
-    assert_eq!(out.status.code(), Some(0), "{text}");
+    Some((out.status.code(), combined(&out)))
+}
+
+#[test]
+fn the_failover_example_passes_on_three_real_nodes() {
+    let bin = require_bddkit!();
+    let etcd = require_etcd_bin!();
+    let Some((code, text)) = run_with_binaries(&bin, &etcd, "examples/cluster.yaml") else {
+        return;
+    };
+    assert_eq!(code, Some(0), "{text}");
     assert!(text.contains("scenarios: 4, failed: 0"), "{text}");
+}
+
+/// The authentication example sets a server up with `etcdctl` and logs in as a
+/// user who may only read; the passwords it uses are in no output.
+#[test]
+fn the_auth_example_passes_on_a_real_server() {
+    let bin = require_bddkit!();
+    let etcd = require_etcd_bin!();
+    let Some((code, text)) = run_with_binaries(&bin, &etcd, "examples/auth.yaml") else {
+        return;
+    };
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("scenarios: 2, failed: 0"), "{text}");
+    for password in [
+        "reader-example-9d2b",
+        "root-example-5c1e",
+        "wrong-example-0000",
+    ] {
+        assert!(!text.contains(password), "{text}");
+    }
 }
