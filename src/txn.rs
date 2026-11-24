@@ -119,7 +119,9 @@ pub fn plan(step: Step, request: &Request) -> Result<Txn, StepError> {
         | Step::LeaseExpired
         | Step::LeaseAliveId
         | Step::LeaseExpiredId
-        | Step::LeaseHolds => Err(StepError::input("not a transaction step")),
+        | Step::LeaseHolds
+        | Step::Authenticate
+        | Step::RefuseAuth => Err(StepError::input("not a transaction step")),
     }
 }
 

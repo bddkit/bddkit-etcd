@@ -157,6 +157,8 @@ pub fn plan(step: Step, request: &Request) -> Result<Lease, StepError> {
         | Step::TxnSucceeded
         | Step::TxnFailed
         | Step::TxnRefuse
+        | Step::Authenticate
+        | Step::RefuseAuth
         | Step::WatchResumedTimes => return Err(StepError::input("not a lease step")),
     })
 }

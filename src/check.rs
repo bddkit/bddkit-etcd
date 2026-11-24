@@ -289,6 +289,8 @@ pub fn plan(step: Step, request: &Request) -> Result<Check, StepError> {
         | Step::TxnSucceeded
         | Step::TxnFailed
         | Step::TxnRefuse
+        | Step::Authenticate
+        | Step::RefuseAuth
         | Step::WatchResumedTimes => Err(StepError::input("not an assertion")),
     }
 }

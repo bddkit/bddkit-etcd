@@ -171,6 +171,8 @@ pub fn plan(step: Step, request: &Request) -> Result<Expect, StepError> {
         | Step::TxnSucceeded
         | Step::TxnFailed
         | Step::TxnRefuse
+        | Step::Authenticate
+        | Step::RefuseAuth
         | Step::WatchResumedTimes => return Err(StepError::input("not an accept / refuse step")),
     };
     Ok(Expect { call, wanted })
