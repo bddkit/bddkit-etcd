@@ -12,7 +12,7 @@ env:
   CARGO_TERM_COLOR: always
   # The host the plugin is tested against: a released bddkit. Bump it
   # deliberately, as its own commit, so a failure after the bump is attributable.
-  HOST_TAG: v0.5.0
+  HOST_TAG: v0.6.0
   # The bddkit-exec release that starts and kills the nodes of the failover
   # example, installed from its release as a user would.
   EXEC_TAG: 0.4.0
