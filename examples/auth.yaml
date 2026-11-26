@@ -4,7 +4,7 @@
 # of an etcd release on PATH. The server listens on 127.0.0.1:25021 (clients)
 # and 25031 (peers). Run from the repository root:
 #   bddkit run --config examples/auth.yaml
-paths: [examples/auth]
+paths: [auth]
 
 default_etcd: main
 

@@ -2,7 +2,7 @@
 # Run from the repository root with a bddkit that loads this plugin:
 #   bddkit run --config examples/etcd.yaml
 #   bddkit run --config examples/etcd.yaml --default etcd=second
-paths: [examples/features]
+paths: [features]
 
 default_etcd: main
 
