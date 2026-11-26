@@ -4,7 +4,7 @@
 # server: the nodes listen on 127.0.0.1:25001 to 25003 (clients) and 25011 to
 # 25013 (peers). Run from the repository root:
 #   bddkit run --config examples/cluster.yaml
-paths: [examples/cluster]
+paths: [cluster]
 
 default_etcd: n1
 

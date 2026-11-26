@@ -2,7 +2,7 @@
 # the error text and the masking. `tests/examples.rs` runs this suite and checks
 # what it prints; it is never meant to be green.
 #   bddkit run --config examples/failing.yaml
-paths: [examples/failing-features]
+paths: [failing-features]
 
 default_etcd: main
 

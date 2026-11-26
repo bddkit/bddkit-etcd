@@ -10,7 +10,7 @@ It speaks the etcd v3 gRPC API, so it serves a team checking what its service wr
 bddkit plugin install bddkit/bddkit-etcd
 ```
 
-Written against plugin ABI 4, so it needs a bddkit that loads that generation.
+Written against plugin ABI 4, so it needs a bddkit that loads that generation. The [examples](#examples), and the tests that run them, need bddkit 0.6.0 or newer: the example configs name `paths` relative to their own folder.
 
 ## Config
 
